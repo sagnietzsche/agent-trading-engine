@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-engine-sdk"
+version = "0.1.0"
+description = "Agent SDK for the trading-engine mock exchange: REST + WebSocket, strategies, tournaments."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "requests>=2.31",
+  "websocket-client>=1.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+trading-agent = "trading_engine.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["trading_engine*"]

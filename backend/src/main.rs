@@ -2,6 +2,8 @@ mod api;
 mod entities;
 mod engine;
 mod store;
+mod views;
+mod ws;
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -91,7 +93,8 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(8080);
 
     log::info!("trading engine listening on http://{host}:{port}");
-    HttpServer::new(move || App::new().app_data(state.clone()).configure(api::routes))
+    HttpServer::new(move || App::new().app_data(state.clone()).route("/ws", web::get().to(ws::index))
+                .configure(api::routes))
         .bind((host.as_str(), port))?
         .run()
         .await

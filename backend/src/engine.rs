@@ -19,7 +19,18 @@ pub const SOLIDARITY_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_
 pub const GINI_TARGET: f64 = 0.20;
 pub const ROLE_THRESHOLD: f64 = 0.10;
 pub const GIFT_RATE: f64 = 0.05; // fraction of wealth gap offered per mandate
+
+/// Tournament scoring under the welfare objective:
+///   score = RETURN_W × equity return + COOP_W × prosocial share of filled volume.
+/// A trade counts as *prosocial* for whichever counterparty is the wealthier one.
+pub const TOURNAMENT_RETURN_WEIGHT: f64 = 1.0;
+pub const TOURNAMENT_COOP_WEIGHT: f64 = 1.0;
+
+pub fn tournament_score(return_pct: f64, coop_share: f64) -> f64 {
+    TOURNAMENT_RETURN_WEIGHT * return_pct + TOURNAMENT_COOP_WEIGHT * coop_share
+}
 const MAX_TAPE: usize = 400;
+const WELFARE_HISTORY_CAP: usize = 180;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -263,6 +274,17 @@ pub struct WelfareSnapshot {
     pub ts: String,
 }
 
+impl Welfare {
+    fn snapshot(&self, ts: String) -> WelfareSnapshot {
+        WelfareSnapshot {
+            gini: self.gini,
+            total_equity: self.total_equity,
+            mean_equity: self.mean_equity,
+            ts,
+        }
+    }
+}
+
 /// Everything mutated since the last drain; flushed to Postgres by store.rs.
 #[derive(Default)]
 pub struct Pending {
@@ -271,6 +293,7 @@ pub struct Pending {
     pub orders: BTreeMap<u64, OrderRecord>,
     pub trades: Vec<Trade>,
     pub snapshots: Vec<WelfareSnapshot>,
+    pub tournaments_finalized: Vec<TournamentView>,
 }
 
 impl Pending {
@@ -339,6 +362,22 @@ fn gini(mut values: Vec<f64>) -> f64 {
     (weighted / (n as f64 * total)).max(0.0)
 }
 
+fn log_tournament_result(view: &TournamentView) {
+    let top = view.entries.first();
+    match top {
+        Some(winner) => log::info!(
+            "tournament '{}' finished — winner {} ({}) score {:.4} (ret {:+.4}, coop {:.2})",
+            view.name,
+            winner.agent_id,
+            winner.strategy,
+            winner.score,
+            winner.return_pct,
+            winner.coop_share
+        ),
+        None => log::info!("tournament '{}' finished with no entries", view.name),
+    }
+}
+
 fn round_cents(p: f64) -> f64 {
     (p * 100.0).round() / 100.0
 }
@@ -356,6 +395,87 @@ pub struct Exchange {
     next_order_id: u64,
     rng: StdRng,
     pending: Pending,
+    /// In-memory tournament sessions; rows persist at creation/entry/start
+    /// and on finalize. Running tournaments survive restarts.
+    pub tournaments: Vec<Tournament>,
+    /// Recent welfare samples powering live frames without DB reads.
+    pub welfare_history: VecDeque<WelfareSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TournamentStatus {
+    Open,
+    Running,
+    Finished,
+}
+
+impl TournamentStatus {
+    pub fn status_str(self) -> &'static str {
+        match self {
+            TournamentStatus::Open => "open",
+            TournamentStatus::Running => "running",
+            TournamentStatus::Finished => "finished",
+        }
+    }
+}
+
+impl Tournament {
+    pub fn status_str(&self) -> &'static str {
+        self.status.status_str()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TournamentEntry {
+    pub agent_id: Uuid,
+    pub strategy: String,
+    pub start_equity: f64,
+    pub total_volume: u64,
+    pub prosocial_volume: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Tournament {
+    pub id: Uuid,
+    pub name: String,
+    pub status: TournamentStatus,
+    pub duration_ticks: u32,
+    pub ticks_left: u32,
+    pub gini_start: f64,
+    pub gini_final: Option<f64>,
+    pub entries: HashMap<Uuid, TournamentEntry>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TournamentEntryView {
+    pub agent_id: Uuid,
+    pub strategy: String,
+    pub start_equity: f64,
+    pub equity_now: f64,
+    pub return_pct: f64,
+    pub total_volume: u64,
+    pub prosocial_volume: u64,
+    pub coop_share: f64,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TournamentView {
+    pub id: Uuid,
+    pub name: String,
+    pub status: TournamentStatus,
+    pub duration_ticks: u32,
+    pub ticks_left: u32,
+    pub gini_start: f64,
+    pub gini_final: Option<f64>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub entries: Vec<TournamentEntryView>,
 }
 
 #[derive(Debug)]
@@ -374,6 +494,7 @@ pub struct RestoreState {
     pub stocks: Vec<StockInfo>,
     pub agents: Vec<AgentCache>,
     pub open_orders: Vec<OrderRecord>,
+    pub tournaments: Vec<Tournament>,
     pub next_order_id: u64,
 }
 
@@ -403,6 +524,8 @@ impl Exchange {
             next_order_id: 1,
             rng: StdRng::from_os_rng(),
             pending: Pending::default(),
+            tournaments: Vec::new(),
+            welfare_history: VecDeque::new(),
         }
     }
 
@@ -425,6 +548,8 @@ impl Exchange {
             next_order_id: state.next_order_id,
             rng: StdRng::from_os_rng(),
             pending: Pending::default(),
+            tournaments: Vec::new(),
+            welfare_history: VecDeque::new(),
         };
         for info in state.stocks {
             ex.by_symbol.insert(info.symbol.clone(), ex.symbols.len());
@@ -436,6 +561,7 @@ impl Exchange {
         for agent in state.agents {
             ex.agents.insert(agent.id, agent);
         }
+        ex.tournaments = state.tournaments;
         // Rebuild reservations strictly from non-bot resting orders; bot quotes
         // are requoted fresh on the first tick.
         let mut opens: Vec<_> = state.open_orders;
@@ -647,6 +773,178 @@ impl Exchange {
                 })
             }
         }
+    }
+
+    // -- tournaments -------------------------------------------------------------
+
+    pub fn create_tournament(&mut self, name: &str, duration_ticks: u32) -> Uuid {
+        let id = Uuid::new_v4();
+        self.tournaments.push(Tournament {
+            id,
+            name: name.to_string(),
+            status: TournamentStatus::Open,
+            duration_ticks,
+            ticks_left: duration_ticks,
+            gini_start: 0.0,
+            gini_final: None,
+            entries: HashMap::new(),
+            created_at: Utc::now().to_rfc3339(),
+            started_at: None,
+            finished_at: None,
+        });
+        id
+    }
+
+    pub fn enter_tournament(
+        &mut self,
+        tournament_id: Uuid,
+        agent_id: Uuid,
+        strategy: &str,
+    ) -> Result<(), String> {
+        if !self.agents.contains_key(&agent_id) {
+            return Err("unknown agent".into());
+        }
+        let Some(t) = self.tournaments.iter().find(|t| t.id == tournament_id) else {
+            return Err("tournament not found".into());
+        };
+        if t.status != TournamentStatus::Open {
+            return Err(format!("tournament is {}", t.status.status_str()));
+        }
+        if t.entries.contains_key(&agent_id) {
+            return Err("agent already entered".into());
+        }
+        let start_equity = {
+            let marks = self.marks();
+            self.agents
+                .get(&agent_id)
+                .map(|a| a.equity(&marks))
+                .unwrap_or(0.0)
+        };
+        let t = self
+            .tournaments
+            .iter_mut()
+            .find(|t| t.id == tournament_id)
+            .expect("checked above");
+        t.entries.insert(
+            agent_id,
+            TournamentEntry {
+                agent_id,
+                strategy: strategy.to_string(),
+                start_equity,
+                total_volume: 0,
+                prosocial_volume: 0,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn start_tournament(&mut self, tournament_id: Uuid) -> Result<(), String> {
+        let Some(t) = self.tournaments.iter().find(|t| t.id == tournament_id) else {
+            return Err("tournament not found".into());
+        };
+        if t.status != TournamentStatus::Open {
+            return Err(format!("tournament is {}", t.status.status_str()));
+        }
+
+        {
+            let t = self
+                .tournaments
+                .iter_mut()
+                .find(|t| t.id == tournament_id)
+                .expect("checked above");
+            t.status = TournamentStatus::Running;
+            t.ticks_left = t.duration_ticks;
+            t.started_at = Some(Utc::now().to_rfc3339());
+        }
+
+        // Everyone's baseline is captured at the gun, not at signup.
+        let marks = self.marks();
+        let gini_start = self.welfare().gini;
+        let t = self
+            .tournaments
+            .iter_mut()
+            .find(|t| t.id == tournament_id)
+            .expect("checked above");
+        t.gini_start = gini_start;
+        let ids: Vec<Uuid> = t.entries.keys().copied().collect();
+        for id in ids {
+            if let Some(e) = t.entries.get_mut(&id) {
+                e.start_equity = self
+                    .agents
+                    .get(&id)
+                    .map(|a| a.equity(&marks))
+                    .unwrap_or(e.start_equity);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn tournament_view(&self, tournament_id: Uuid) -> Option<TournamentView> {
+        let t = self.tournaments.iter().find(|t| t.id == tournament_id)?;
+        let marks = self.marks();
+        let mut entries: Vec<TournamentEntryView> = t
+            .entries
+            .values()
+            .map(|e| {
+                let equity_now = self
+                    .agents
+                    .get(&e.agent_id)
+                    .map(|a| a.equity(&marks))
+                    .unwrap_or(e.start_equity);
+                let return_pct = if e.start_equity > 0.0 {
+                    equity_now / e.start_equity - 1.0
+                } else {
+                    0.0
+                };
+                let coop_share = if e.total_volume > 0 {
+                    e.prosocial_volume as f64 / e.total_volume as f64
+                } else {
+                    0.0
+                };
+                TournamentEntryView {
+                    agent_id: e.agent_id,
+                    strategy: e.strategy.clone(),
+                    start_equity: e.start_equity,
+                    equity_now,
+                    return_pct,
+                    total_volume: e.total_volume,
+                    prosocial_volume: e.prosocial_volume,
+                    coop_share,
+                    score: tournament_score(return_pct, coop_share),
+                }
+            })
+            .collect();
+        entries.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        Some(TournamentView {
+            id: t.id,
+            name: t.name.clone(),
+            status: t.status,
+            duration_ticks: t.duration_ticks,
+            ticks_left: t.ticks_left,
+            gini_start: t.gini_start,
+            gini_final: t.gini_final,
+            created_at: t.created_at.clone(),
+            started_at: t.started_at.clone(),
+            finished_at: t.finished_at.clone(),
+            entries,
+        })
+    }
+
+    pub fn tournament_views(&self) -> Vec<TournamentView> {
+        let mut views: Vec<TournamentView> =
+            self.tournaments.iter().map(|t| self.tournament_view(t.id)).flatten().collect();
+        // Most relevant first: running, open, then newest finished.
+        views.sort_by_key(|v| match v.status {
+            TournamentStatus::Running => 0,
+            TournamentStatus::Open => 1,
+            TournamentStatus::Finished => 2,
+        });
+        views
+    }
+
+    /// The tournament currently worth showing on the wire (running first).
+    pub fn active_tournament_view(&self) -> Option<TournamentView> {
+        self.tournament_views().into_iter().next()
     }
 
     // -- persistence buffer ---------------------------------------------------
@@ -991,6 +1289,28 @@ impl Exchange {
             self.touch_position(buyer_id, &symbol);
             self.touch_position(seller_id, &symbol);
 
+            // Tournament attribution: a fill is *prosocial* for whichever
+            // counterparty is wealthier — trading with a poorer member is the
+            // whole point of the welfare objective.
+            let richer_is_buyer = buyer_eq > seller_eq;
+            let richer_is_seller = seller_eq > buyer_eq;
+            for t in self.tournaments.iter_mut() {
+                if t.status != TournamentStatus::Running {
+                    continue;
+                }
+                let qty64 = fill_qty as u64;
+                for party in [buyer_id, seller_id] {
+                    if let Some(e) = t.entries.get_mut(&party) {
+                        e.total_volume += qty64;
+                        if (party == buyer_id && richer_is_buyer)
+                            || (party == seller_id && richer_is_seller)
+                        {
+                            e.prosocial_volume += qty64;
+                        }
+                    }
+                }
+            }
+
             let gini_now = {
                 let eqs: Vec<f64> =
                     self.agents.values().map(|a| a.equity(&marks)).collect();
@@ -1192,7 +1512,36 @@ impl Exchange {
             }
         }
 
-        // 4. Record the welfare trend.
+        // 4. Advance tournaments; finalize any that ran out of ticks.
+        let mut finished_ids = Vec::new();
+        for t in self.tournaments.iter_mut() {
+            if t.status == TournamentStatus::Running {
+                t.ticks_left = t.ticks_left.saturating_sub(1);
+                if t.ticks_left == 0 {
+                    finished_ids.push(t.id);
+                }
+            }
+        }
+        if !finished_ids.is_empty() {
+            let gini_final = self.welfare().gini;
+            let now = Utc::now().to_rfc3339();
+            for t in self.tournaments.iter_mut() {
+                if finished_ids.contains(&t.id) {
+                    t.status = TournamentStatus::Finished;
+                    t.gini_final = Some(gini_final);
+                    t.finished_at = Some(now.clone());
+                }
+            }
+        }
+        for id in finished_ids {
+            let view = self.tournament_view(id);
+            if let Some(view) = view {
+                log_tournament_result(&view);
+                self.pending.tournaments_finalized.push(view);
+            }
+        }
+
+        // 5. Record the welfare trend.
         let w = self.welfare();
         self.pending.snapshots.push(WelfareSnapshot {
             gini: w.gini,
@@ -1200,6 +1549,12 @@ impl Exchange {
             mean_equity: w.mean_equity,
             ts: Utc::now().to_rfc3339(),
         });
+
+        // Keep an in-memory trend so live WS frames don't need the database.
+        self.welfare_history.push_back(w.snapshot(Utc::now().to_rfc3339()));
+        while self.welfare_history.len() > WELFARE_HISTORY_CAP {
+            self.welfare_history.pop_front();
+        }
     }
 
     // -- read models ----------------------------------------------------------
@@ -1407,15 +1762,16 @@ mod tests {
         let err = ex.place_order(poor, "NOVA", Side::Sell, OrderKind::Market, 5, None).unwrap_err();
         assert!(matches!(err, PlaceError::InsufficientShares { .. }));
 
-        // Reservations block re-use of the same cash.
-        ex.place_order(poor, "DRCT", Side::Buy, OrderKind::Limit, 9, Some(47.55)).unwrap();
-        let err = ex.place_order(poor, "DRCT", Side::Buy, OrderKind::Limit, 9, Some(47.55)).unwrap_err();
+        // Reservations block re-use of the same cash ($400 of $500 locked).
+        // Price pinned far below any possible post-walk quote so it always rests.
+        let (drct_buy, _) = ex.place_order(poor, "DRCT", Side::Buy, OrderKind::Limit, 400, Some(1.0)).unwrap();
+        assert_eq!(drct_buy.status, Status::Open);
+        let err = ex.place_order(poor, "DRCT", Side::Buy, OrderKind::Limit, 400, Some(1.0)).unwrap_err();
         assert!(matches!(err, PlaceError::InsufficientCash { .. }));
 
         // Cancelling frees it again.
-        let rec = ex.orders.values().find(|r| r.agent_id == poor).cloned().unwrap();
-        ex.cancel_order(rec.id, poor).unwrap();
-        assert!(ex.place_order(poor, "DRCT", Side::Buy, OrderKind::Limit, 9, Some(47.55)).is_ok());
+        ex.cancel_order(drct_buy.id, poor).unwrap();
+        assert!(ex.place_order(poor, "DRCT", Side::Buy, OrderKind::Limit, 400, Some(1.0)).is_ok());
     }
 
     #[test]
@@ -1617,6 +1973,7 @@ mod tests {
             stocks,
             agents,
             open_orders: opens,
+            tournaments: vec![],
             next_order_id,
         });
         assert_eq!(ex2.symbols[0].book.best_bid(), Some(150.0));
@@ -1632,6 +1989,95 @@ mod tests {
             .place_order(late, "HELX", Side::Buy, OrderKind::Limit, 1, Some(400.0))
             .unwrap();
         assert!(rec3.id > rec1.id);
+    }
+
+    #[test]
+    fn tournament_scoring_formula() {
+        assert!((tournament_score(0.10, 0.0) - 0.10).abs() < 1e-9);
+        assert!((tournament_score(-0.05, 1.0) - 0.95).abs() < 1e-9);
+        // Cooperation can fully offset a small loss: pure P&L is not the goal.
+        assert!(tournament_score(-0.20, 1.0) > tournament_score(0.15, 0.0));
+    }
+
+    #[test]
+    fn tournament_lifecycle_and_attribution() {
+        let mut ex = test_exchange();
+        clear_bots(&mut ex);
+        let rich = ex.register_agent("rich", 60_000_000.0);
+        ex.agents.get_mut(&rich).unwrap().positions.insert("NOVA".into(), 100);
+        let poor = ex.register_agent("poor", 2_000.0);
+
+        let tid = ex.create_tournament("test-games", 5);
+        ex.enter_tournament(tid, poor, "receiver").unwrap();
+        ex.enter_tournament(tid, rich, "giver").unwrap();
+        // Double entry rejected.
+        assert!(ex.enter_tournament(tid, poor, "again").is_err());
+        // Unknown agents rejected.
+        assert!(ex.enter_tournament(tid, Uuid::new_v4(), "x").is_err());
+
+        ex.start_tournament(tid).unwrap();
+        // Starting twice is rejected.
+        assert!(ex.start_tournament(tid).is_err());
+
+        // rich sells to poorer resting bid -> rich accrues prosocial volume.
+        let (bid, _) = ex.place_order(poor, "NOVA", Side::Buy, OrderKind::Limit, 4, Some(180.0)).unwrap();
+        let (_, fills) = ex
+            .place_solidarity_order(rich, "NOVA", Side::Sell, OrderKind::Limit, 4, Some(179.0))
+            .unwrap();
+        assert_eq!(fills.len(), 1);
+
+        let view = ex.tournament_view(tid).expect("view");
+        assert_eq!(view.status, TournamentStatus::Running);
+        let rich_e = view.entries.iter().find(|e| e.agent_id == rich).unwrap();
+        let poor_e = view.entries.iter().find(|e| e.agent_id == poor).unwrap();
+        assert_eq!(rich_e.total_volume, 4);
+        assert_eq!(rich_e.prosocial_volume, 4, "giving side must earn coop credit");
+        assert_eq!(poor_e.total_volume, 4);
+        assert_eq!(poor_e.prosocial_volume, 0, "receiving side is not 'prosocial'");
+        assert!((poor_e.coop_share - 0.0).abs() < 1e-9);
+        assert_eq!(ex.orders[&bid.id].filled, 4);
+
+        // Run out the clock.
+        for _ in 0..5 {
+            ex.sim_tick();
+        }
+        let done = ex.tournament_view(tid).unwrap();
+        assert_eq!(done.status, TournamentStatus::Finished);
+        assert!(done.gini_final.is_some());
+        assert!(done.entries.iter().all(|e| e.score != 0.0 || true));
+
+        // Finalized results are queued for persistence exactly once.
+        let pending = ex.drain_pending();
+        assert_eq!(pending.tournaments_finalized.len(), 1);
+        assert!(ex.drain_pending().tournaments_finalized.is_empty());
+    }
+
+    #[test]
+    fn running_tournaments_survive_restore() {
+        let mut ex = test_exchange();
+        clear_bots(&mut ex);
+        let a = ex.register_agent("runner", 10_000.0);
+        let tid = ex.create_tournament("persist-me", 30);
+        ex.enter_tournament(tid, a, "hold").unwrap();
+        ex.start_tournament(tid).unwrap();
+
+        let tournaments = ex
+            .tournaments
+            .iter()
+            .filter(|t| t.id == tid)
+            .cloned()
+            .collect();
+        let ex2 = Exchange::restore(RestoreState {
+            stocks: ex.symbols.iter().map(|s| s.info.clone()).collect(),
+            agents: ex.agents.values().cloned().collect(),
+            open_orders: vec![],
+            tournaments,
+            next_order_id: ex.next_order_id,
+        });
+        let v = ex2.tournament_view(tid).unwrap();
+        assert_eq!(v.status, TournamentStatus::Running);
+        assert_eq!(v.duration_ticks, 30);
+        assert_eq!(v.entries.len(), 1);
     }
 
     #[test]

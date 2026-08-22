@@ -4,6 +4,7 @@ import type {
   PlaceOrderResult,
   Side,
   Snapshot,
+  TournamentView,
   WelfareResp,
 } from './types'
 
@@ -47,4 +48,18 @@ export const api = {
     req<{ status: string }>(`/orders/${orderId}?agent_id=${agentId}`, { method: 'DELETE' }),
 
   reset: () => req<{ status: string }>('/admin/reset', { method: 'POST' }),
+
+  createTournament: (name: string, durationTicks: number) =>
+    req<TournamentView>('/tournaments', {
+      method: 'POST',
+      body: JSON.stringify({ name, duration_ticks: durationTicks }),
+    }),
+  listTournaments: () => req<TournamentView[]>('/tournaments'),
+  enterTournament: (id: string, agentId: string, strategy: string) =>
+    req<TournamentView>(`/tournaments/${id}/enter`, {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: agentId, strategy }),
+    }),
+  startTournament: (id: string) =>
+    req<TournamentView>(`/tournaments/${id}/start`, { method: 'POST' }),
 }

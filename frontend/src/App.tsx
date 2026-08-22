@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import './App.css'
 import { api } from './api'
-import type { AgentDetail, Snapshot, WelfareResp } from './types'
+import { connectLive, type LiveMode, type Subscription } from './live'
+import type { LiveFrame } from './types'
 import { WelfareBar } from './components/WelfareBar'
 import { StocksTable } from './components/StocksTable'
 import { BookLadder } from './components/BookLadder'
@@ -8,21 +10,40 @@ import { TapePanel } from './components/TapePanel'
 import { AgentsTable } from './components/AgentsTable'
 import { TradeTicket } from './components/TradeTicket'
 import { MyDesk } from './components/MyDesk'
+import { TournamentPanel } from './components/TournamentPanel'
+import { DocsPage } from './pages/Docs'
 
-const POLL_MS = 1200
-const WELFARE_EVERY = 3
+function useRoute(): 'docs' | 'floor' {
+  const [path, setPath] = useState(window.location.pathname)
+  useEffect(() => {
+    const onPop = () => setPath(window.location.pathname)
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+  return path.startsWith('/docs') ? 'docs' : 'floor'
+}
 
 export default function App() {
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
-  const [welfare, setWelfare] = useState<WelfareResp | null>(null)
-  const [agentDetail, setAgentDetail] = useState<AgentDetail | null>(null)
-  const [selectedSymbol, setSelectedSymbol] = useState('NOVA')
-  const [selectedAgent, setSelectedAgent] = useState<string | null>(() =>
-    localStorage.getItem('agent_id'),
-  )
+  const route = useRoute()
+  return route === 'docs' ? <DocsPage /> : <Dashboard />
+}
+
+function Dashboard() {
+  const [frame, setFrame] = useState<LiveFrame | null>(null)
+  const [mode, setMode] = useState<LiveMode>('connecting')
+  const [sub, setSub] = useState<Subscription>({
+    symbol: 'NOVA',
+    agentId: localStorage.getItem('agent_id'),
+  })
   const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null)
   const [newAgentName, setNewAgentName] = useState('')
-  const tick = useRef(0)
+
+  // Keep a ref in sync so the live connection can read the latest
+  // subscription without re-connecting.
+  const subRef = useRef<Subscription>(sub)
+  useEffect(() => {
+    subRef.current = sub
+  }, [sub])
 
   const showToast = useCallback((msg: string, ok: boolean) => {
     setToast({ msg, ok })
@@ -30,38 +51,29 @@ export default function App() {
   }, [])
 
   const selectAgent = useCallback((id: string | null) => {
-    setSelectedAgent(id)
     if (id) localStorage.setItem('agent_id', id)
     else localStorage.removeItem('agent_id')
+    setSub((s) => ({ ...s, agentId: id }))
   }, [])
 
-  // Polling loop: snapshot every tick, welfare + agent desk periodically.
+  const selectSymbol = useCallback((symbol: string) => {
+    setSub((s) => ({ ...s, symbol }))
+  }, [])
+
+  // One live connection drives every panel.
   useEffect(() => {
-    let alive = true
-    const poll = async () => {
-      try {
-        const snap = await api.snapshot(selectedSymbol)
-        if (!alive) return
-        setSnapshot(snap)
-        if (!snap.agents.some((a) => a.id === selectedAgent)) {
-          const human = snap.agents.find((a) => !a.is_bot)
-          selectAgent(human?.id ?? null)
-          return
+    return connectLive(
+      () => subRef.current,
+      (f) => {
+        setFrame(f)
+        // If our agent vanished (e.g. market reset), re-select a human.
+        if (!f.agents.some((a) => a.id === subRef.current.agentId)) {
+          selectAgent(f.agents.find((a) => !a.is_bot)?.id ?? null)
         }
-        const n = ++tick.current
-        if (n % WELFARE_EVERY === 0) setWelfare(await api.welfare())
-        if (selectedAgent) setAgentDetail(await api.agent(selectedAgent))
-      } catch {
-        /* backend briefly unavailable; keep last frame */
-      }
-    }
-    poll()
-    const t = window.setInterval(poll, POLL_MS)
-    return () => {
-      alive = false
-      window.clearInterval(t)
-    }
-  }, [selectedSymbol, selectedAgent, selectAgent])
+      },
+      setMode,
+    )
+  }, [selectAgent])
 
   const createAgent = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -87,13 +99,21 @@ export default function App() {
     }
   }
 
+  const desk = frame?.desk ?? null
+
   return (
     <div className="shell">
       <header>
         <div>
-          <h1>trading-engine</h1>
+          <h1>
+            trading-engine
+            <span className="chip" title={`feed mode: ${mode}`}>
+              {mode === 'ws' ? '● live' : mode === 'polling' ? '◐ polling' : '○ connecting'}
+            </span>
+          </h1>
           <p className="tagline">
-            a mock exchange where agents are rewarded for lifting each other, not for winning
+            a mock exchange where agents lift each other instead of winning ·{' '}
+            <a href="/docs">read the docs →</a>
           </p>
         </div>
         <form className="join" onSubmit={createAgent}>
@@ -111,44 +131,45 @@ export default function App() {
         </form>
       </header>
 
-      {welfare && <WelfareBar welfare={welfare.welfare} history={welfare.history} />}
+      {frame && <WelfareBar welfare={frame.welfare} history={frame.history ?? []} />}
 
       <main className="grid">
         <div className="col">
-          {snapshot && (
-            <StocksTable stocks={snapshot.stocks} selected={selectedSymbol} onSelect={setSelectedSymbol} />
+          {frame && (
+            <StocksTable stocks={frame.stocks} selected={sub.symbol} onSelect={selectSymbol} />
           )}
-          {snapshot && (
+          {frame && (
             <AgentsTable
-              agents={snapshot.agents}
-              mandates={welfare?.agents ?? []}
-              selected={selectedAgent}
+              agents={frame.agents}
+              mandates={frame.mandates ?? []}
+              selected={sub.agentId}
               onSelect={selectAgent}
             />
           )}
         </div>
 
         <div className="col">
-          <BookLadder book={snapshot?.book ?? null} />
+          <BookLadder book={frame?.book ?? null} />
           <TradeTicket
-            stocks={snapshot?.stocks ?? []}
-            agentId={selectedAgent}
-            agentDetail={agentDetail}
+            stocks={frame?.stocks ?? []}
+            agentId={sub.agentId}
+            agentDetail={desk}
             onDone={showToast}
           />
         </div>
 
         <div className="col">
-          <MyDesk detail={agentDetail} onChanged={() => undefined} />
-          {snapshot && <TapePanel tape={snapshot.tape} />}
+          <MyDesk detail={desk} onChanged={() => undefined} />
+          <TournamentPanel tournament={frame?.tournament ?? null} selectedAgent={sub.agentId} />
+          {frame && <TapePanel tape={frame.tape} />}
         </div>
       </main>
 
       {toast && <div className={`toast ${toast.ok ? 'ok' : 'err'}`}>{toast.msg}</div>}
 
       <footer className="muted">
-        Rust · actix-web · SeaORM · Postgres — matching runs in memory and persists every order,
-        trade and balance to the database.
+        Rust · actix-web · SeaORM · Postgres — matched in memory, persisted write-through, streamed
+        over WebSocket. <a href="/docs">API &amp; code docs</a>.
       </footer>
     </div>
   )

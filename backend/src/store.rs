@@ -10,8 +10,24 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use crate::engine::{AgentCache, Exchange, OrderKind, OrderRecord, RestoreState, Side, Status, StockInfo};
-use crate::entities::{agents, orders, positions, stocks, trades, welfare_snapshots};
+use crate::engine::{
+    AgentCache, Exchange, OrderKind, OrderRecord, RestoreState, Side, Status, StockInfo,
+    Tournament, TournamentEntry, TournamentStatus, TournamentView,
+};
+use crate::entities::{
+    agents, orders, positions, stocks, tournament_entries, tournaments, trades,
+    welfare_snapshots,
+};
+
+fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|t| t.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|_| chrono::Utc::now())
+}
+
+fn ots(s: &Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
+    s.as_deref().map(ts)
+}
 
 pub const STARTING_CASH: f64 = 100_000.0;
 /// (symbol, company name, base price)
@@ -48,6 +64,8 @@ pub async fn is_empty(db: &DatabaseConnection) -> Result<bool, DbErr> {
 /// Wipe every table. Used by POST /api/admin/reset before a fresh reseed.
 pub async fn reset_all(db: &DatabaseConnection) -> Result<(), DbErr> {
     for sql in [
+        "DELETE FROM tournament_entries",
+        "DELETE FROM tournaments",
         "DELETE FROM trades",
         "DELETE FROM orders",
         "DELETE FROM positions",
@@ -241,6 +259,7 @@ fn to_restore(state: LoadedRow) -> RestoreState {
         stocks: stocks_vec,
         agents: caches.into_values().collect(),
         open_orders: opens,
+        tournaments: Vec::new(), // filled by boot_exchange via load_open_tournaments
         next_order_id: (state.max_order_id as u64) + 1,
     }
 }
@@ -248,8 +267,134 @@ fn to_restore(state: LoadedRow) -> RestoreState {
 /// Build the in-memory exchange from whatever is currently in Postgres.
 pub async fn boot_exchange(db: &DatabaseConnection) -> Result<Exchange, DbErr> {
     let rows = load_rows(db).await?;
-    let restored = to_restore(rows);
+    let mut restored = to_restore(rows);
+    restored.tournaments = load_open_tournaments(db).await?;
     Ok(Exchange::restore(restored))
+}
+
+/// Reload unfinished tournaments so a restart doesn't kill a live competition.
+pub async fn load_open_tournaments(
+    db: &DatabaseConnection,
+) -> Result<Vec<Tournament>, DbErr> {
+    let rows = tournaments::Entity::find()
+        .filter(tournaments::Column::Status.is_in(["open", "running"]))
+        .all(db)
+        .await?;
+    if rows.is_empty() {
+        return Ok(vec![]);
+    }
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let entry_rows = tournament_entries::Entity::find()
+        .filter(tournament_entries::Column::TournamentId.is_in(ids))
+        .all(db)
+        .await?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        let mut entries = std::collections::HashMap::new();
+        for e in entry_rows.iter().filter(|e| e.tournament_id == r.id) {
+            entries.insert(
+                e.agent_id,
+                TournamentEntry {
+                    agent_id: e.agent_id,
+                    strategy: e.strategy.clone(),
+                    start_equity: d2f(e.start_equity),
+                    total_volume: e.total_volume.max(0) as u64,
+                    prosocial_volume: e.prosocial_volume.max(0) as u64,
+                },
+            );
+        }
+        out.push(Tournament {
+            id: r.id,
+            name: r.name.clone(),
+            status: match r.status.as_str() {
+                "running" => TournamentStatus::Running,
+                _ => TournamentStatus::Open,
+            },
+            duration_ticks: r.duration_ticks.max(1) as u32,
+            ticks_left: r.ticks_left.clamp(0, r.duration_ticks) as u32,
+            gini_start: d2f(r.gini_start),
+            gini_final: r.gini_final.map(d2f),
+            entries,
+            created_at: r.created_at.to_rfc3339(),
+            started_at: r.started_at.map(|t| t.to_rfc3339()),
+            finished_at: r.finished_at.map(|t| t.to_rfc3339()),
+        });
+    }
+    Ok(out)
+}
+
+/// Upsert a tournament snapshot plus all of its entries. Works inside a
+/// transaction too (used by flush for finalized results).
+pub async fn save_tournament<C>(db: &C, view: &TournamentView) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let tm = tournaments::ActiveModel {
+        id: Set(view.id),
+        name: Set(view.name.clone()),
+        status: Set(view.status.status_str().to_string()),
+        duration_ticks: Set(view.duration_ticks as i32),
+        ticks_left: Set(view.ticks_left as i32),
+        gini_start: Set(f2d(view.gini_start)),
+        gini_final: Set(view.gini_final.map(f2d)),
+        created_at: Set(ts(&view.created_at)),
+        started_at: Set(ots(&view.started_at)),
+        finished_at: Set(ots(&view.finished_at)),
+    };
+    tournaments::Entity::insert(tm)
+        .on_conflict(
+            OnConflict::column(tournaments::Column::Id)
+                .update_columns([
+                    tournaments::Column::Name,
+                    tournaments::Column::Status,
+                    tournaments::Column::DurationTicks,
+                    tournaments::Column::TicksLeft,
+                    tournaments::Column::GiniStart,
+                    tournaments::Column::GiniFinal,
+                    tournaments::Column::StartedAt,
+                    tournaments::Column::FinishedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(db)
+        .await?;
+
+    for e in &view.entries {
+        let em = tournament_entries::ActiveModel {
+            tournament_id: Set(view.id),
+            agent_id: Set(e.agent_id),
+            strategy: Set(e.strategy.clone()),
+            start_equity: Set(f2d(e.start_equity)),
+            total_volume: Set(e.total_volume as i64),
+            prosocial_volume: Set(e.prosocial_volume as i64),
+            return_pct: Set(Some(f2d(e.return_pct))),
+            coop_share: Set(Some(f2d(e.coop_share))),
+            score: Set(Some(f2d(e.score))),
+            finished_at: Set(ots(&view.finished_at)),
+        };
+        tournament_entries::Entity::insert(em)
+            .on_conflict(
+                OnConflict::columns([
+                    tournament_entries::Column::TournamentId,
+                    tournament_entries::Column::AgentId,
+                ])
+                .update_columns([
+                    tournament_entries::Column::Strategy,
+                    tournament_entries::Column::StartEquity,
+                    tournament_entries::Column::TotalVolume,
+                    tournament_entries::Column::ProsocialVolume,
+                    tournament_entries::Column::ReturnPct,
+                    tournament_entries::Column::CoopShare,
+                    tournament_entries::Column::Score,
+                    tournament_entries::Column::FinishedAt,
+                ])
+                .to_owned(),
+            )
+            .exec(db)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Write-through persistence for everything the engine mutated in one step.
@@ -372,6 +517,10 @@ pub async fn flush(db: &DatabaseConnection, pending: &crate::engine::Pending) ->
             ),
         };
         welfare_snapshots::Entity::insert(sm).exec(&txn).await?;
+    }
+
+    for view in &pending.tournaments_finalized {
+        save_tournament(&txn, view).await?;
     }
 
     txn.commit().await

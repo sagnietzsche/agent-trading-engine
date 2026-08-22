@@ -1,6 +1,7 @@
 export type Side = 'buy' | 'sell'
 export type OrderKind = 'limit' | 'market'
 export type Role = 'contributor' | 'beneficiary' | 'neutral'
+export type TournamentStatus = 'open' | 'running' | 'finished'
 
 export interface StockView {
   symbol: string
@@ -10,11 +11,6 @@ export interface StockView {
   prev_close: number
   bid: number | null
   ask: number | null
-}
-
-export interface Level {
-  0: number // price
-  1: number // qty
 }
 
 export interface BookView {
@@ -77,21 +73,6 @@ export interface WelfarePoint {
   ts: string
 }
 
-export interface WelfareResp {
-  welfare: Welfare
-  agents: Mandate[]
-  history: WelfarePoint[]
-}
-
-export interface Snapshot {
-  welfare: Welfare
-  stocks: StockView[]
-  book: BookView | null
-  tape: Trade[]
-  agents: AgentSummary[]
-  tournament: TournamentView | null
-}
-
 export interface PositionView {
   symbol: string
   qty: number
@@ -127,14 +108,6 @@ export interface AgentDetail {
   open_orders: OrderRecord[]
 }
 
-export interface PlaceOrderResult {
-  order: OrderRecord
-  fills: { trade_id: string; price: number; qty: number }[]
-  free_cash: number
-}
-
-export type TournamentStatus = 'open' | 'running' | 'finished'
-
 export interface TournamentEntryView {
   agent_id: string
   strategy: string
@@ -161,16 +134,15 @@ export interface TournamentView {
   entries: TournamentEntryView[]
 }
 
-/** One push frame from /api/ws (or synthesized by polling fallback). */
 export interface LiveFrame {
-  type: 'snapshot'
-  seq: number
-  stocks: StockView[]
-  book: BookView | null
-  tape: Trade[]
-  agents: AgentSummary[]
-  welfare: Welfare
-  tournament: TournamentView | null
+  type: 'snapshot' | 'subscribed' | 'pong'
+  seq?: number
+  stocks?: StockView[]
+  book?: BookView | null
+  tape?: Trade[]
+  agents?: AgentSummary[]
+  welfare?: Welfare
+  tournament?: TournamentView | null
   mandates?: Mandate[]
   history?: WelfarePoint[]
   desk?: AgentDetail

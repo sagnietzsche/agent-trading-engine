@@ -79,7 +79,8 @@ If you want a clean slate later: **Reset market** button or `POST /api/admin/res
 - **Matching runs in memory** for speed. Each symbol has a price-time priority book. A `std::sync::Mutex` guards the whole exchange; request handlers mutate under the lock and release it before doing any async I/O.
 - **Postgres is the source of truth for accounts and history.** Every mutation produces a batched, transactional flush (`Pending` buffer → upserts). If a DB write fails the in-memory state stays consistent and the error is logged — the next mutation retries persistence.
 - **Crash-safe restart**: on boot the engine loads agents/positions/open orders from Postgres, rebuilds the books, recomputes cash reservations, resumes order-id sequencing, and keeps trading. Kill it mid-session; nothing is lost.
-- A background task ticks once per second: random-walk fair values, requote the market maker, fire solidarity flow, and append a welfare snapshot.
+- A background task ticks once per second: random-walk fair values, requote the market maker, fire solidarity flow, advance tournaments and append a welfare snapshot.
+- **WebSocket streaming**: `/api/ws` pushes a full snapshot frame every second; the frontend renders straight off those frames (with automatic polling fallback if the socket dies).
 
 ### Project layout
 
@@ -93,15 +94,27 @@ trading-engine/
 │   │   └── src/m20260822_000001_init.rs
 │   └── src/
 │       ├── main.rs             # env, DB connect+migrate, boot/rebuild, sim loop, HttpServer
-│       ├── engine.rs           # PURE matching + welfare logic (no DB, no async) + unit tests
+│       ├── engine.rs           # PURE matching + welfare + tournaments (no DB) + unit tests
 │       ├── store.rs            # SeaORM: connect/migrate/seed/flush/boot-load/reset/history
-│       ├── api.rs              # HTTP handlers + DTOs + error mapping
+│       ├── api.rs              # HTTP handlers + DTOs + error mapping (incl. tournaments)
+│       ├── ws.rs               # /api/ws live frames (sender/receiver tasks per conn)
+│       ├── views.rs            # read-models shared by REST & WS + LiveFrame builder
 │       └── entities/           # one file per table (agents, stocks, orders, trades,
 │                               #  positions, welfare_snapshots)
+├── sdk/
+│   ├── python/                 # pip install -e sdk/python · trading-agent CLI
+│   │   ├── trading_engine/{client,ws,agent,cli}.py
+│   │   └── examples/
+│   └── typescript/             # npm run build (Node >=22, zero runtime deps)
+│       ├── src/{client,ws,strategies,agent}.ts
+│       └── examples/{mandate-bot,tournament-demo}.ts
 └── frontend/
     ├── vite.config.ts          # dev proxy: /api -> http://127.0.0.1:8080
     └── src/
-        ├── App.tsx             # dashboard shell + polling loop
+        ├── App.tsx             # routes /docs ↔ trading floor; frame-driven panels
+        ├── live.ts             # WebSocket client + polling fallback
+        ├── pages/Docs.tsx      # in-app API & code documentation at /docs
+        ├── docs/content.ts     # endpoint reference data for the docs page
         ├── api.ts / types.ts / format.ts
         ├── index.css / App.css # dark terminal theme
         └── components/
@@ -202,6 +215,8 @@ Created by the initial SeaORM migration (`backend/migration/src/m20260822_000001
 | `trades` | `id uuid pk, symbol fk→stocks, price, qty, buyer fk→agents, seller fk→agents, taker_order bigint fk→orders, buyer_equity, seller_equity, gini_after numeric(10,6), ts` | indexed `(symbol, ts)` |
 | `positions` | `(agent_id, symbol) pk, qty int` | qty may be negative for system bots |
 | `welfare_snapshots` | `id bigserial pk, gini numeric(10,6), total_equity numeric(22,4), mean_equity numeric(20,4), ts` | one row per sim tick |
+| `tournaments` | `id uuid pk, name, status, duration_ticks, ticks_left, gini_start numeric(10,6), gini_final null, created_at, started_at null, finished_at null` | competition sessions |
+| `tournament_entries` | `(tournament_id, agent_id) pk fk→agents, strategy, start_equity, total_volume, prosocial_volume, return_pct null, coop_share null, score null, finished_at null` | enrolled strategies & results |
 
 FK constraints enforce that trades/orders/positions always reference real agents and listings.
 
@@ -271,6 +286,72 @@ The UI reflects the objective everywhere: the Gini gauge and trend, per-agent ro
 
 ---
 
+## Tournament mode
+
+Strategies compete under the welfare objective — not raw profit:
+
+```
+score = RETURN_WEIGHT × equity_return + COOP_WEIGHT × coop_share        (both weights = 1.0)
+
+equity_return = equity_end / equity_start − 1          baseline captured at start()
+coop_share    = prosocial_volume / total_volume
+
+A fill is *prosocial* for whichever side is WEALTHIER:
+  richer seller → poorer buyer  ⇒ seller earns coop credit (giving a discount)
+  richer buyer  → poorer seller ⇒ buyer earns coop credit (paying up)
+```
+
+Cooperation can fully offset a modest loss, so a pure profit-maximizer loses to a strategy that
+trades with poorer members. Lifecycle: **create → enter (while open) → start → runs N sim ticks
+(~1 s each) → finalize** — scores are persisted and running tournaments survive restarts.
+Watch it live on the dashboard or via the WS frame's `tournament` field.
+
+## Agent SDKs
+
+Identical concepts in both languages: REST client, live-frame stream, pluggable `Strategy`,
+a reference `MandateStrategy` that plays along with the collective, and tournament helpers.
+
+**Python** (`sdk/python`):
+
+```bash
+pip install -e sdk/python
+
+trading-agent --name lenin --strategy mandate --duration 120
+trading-agent --name greedo --strategy greedy --duration 90 \
+    --join-tournament welfare-games --start
+```
+
+```python
+from trading_engine import TradingClient, Agent, MandateStrategy
+
+client = TradingClient("http://127.0.0.1:8080")
+agent = Agent.create(client, "emma")
+stats = agent.run(MandateStrategy(), duration_s=60)
+```
+
+**TypeScript** (`sdk/typescript`, Node ≥ 22, zero runtime deps):
+
+```bash
+cd sdk/typescript && npm run build
+node examples/mandate-bot.ts         # cooperative bot over WebSocket
+node examples/tournament-demo.ts     # mandate vs greedy with live scoreboard
+```
+
+```ts
+import { TradingClient, Agent, MandateStrategy } from '@trading-engine/sdk'
+const client = new TradingClient('http://127.0.0.1:8080')
+const agent = await Agent.create(client, 'luxemburg')
+await agent.run(new MandateStrategy(), { durationMs: 60_000 })
+```
+
+Pit `--strategy mandate` against `--strategy greedy` in one tournament and watch cooperation beat greed on the scoreboard.
+
+## In-app documentation
+
+The frontend serves a full reference at **`/docs`** — every endpoint with runnable try-it buttons,
+the WebSocket protocol with a live frame console, tournament scoring rules, SDK snippets, and a
+file-by-file codebase guide.
+
 ## API reference
 
 All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"}`.
@@ -278,7 +359,8 @@ All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"
 | Method | Path | Description |
 |---|---|---|
 | GET | `/api/health` | liveness + database connectivity |
-| GET | `/api/snapshot?symbol=NOVA` | aggregate poll: welfare, stocks, book (10 levels), last 40 trades, agents |
+| GET | `/api/ws?symbol=&agent_id=` | **WebSocket upgrade**: snapshot frames every ~1 s; client sends `{type:"subscribe",…}` |
+| GET | `/api/snapshot?symbol=NOVA` | aggregate poll: welfare, stocks, book, last 40 trades, agents, active tournament |
 | GET | `/api/welfare` | Gini stats, target, mandates for every agent, recent history (≤90 pts) |
 | GET | `/api/stocks` | listings with last/bid/ask/change |
 | GET | `/api/book/{symbol}?levels=10` | aggregated depth ladder |
@@ -288,6 +370,10 @@ All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"
 | GET | `/api/agents/{id}` | full desk: balances, positions, open orders, current mandate |
 | POST | `/api/orders` | place an order |
 | DELETE | `/api/orders/{id}?agent_id=` | cancel one of your resting orders |
+| POST | `/api/tournaments` | create `{name?, duration_ticks?}` (default 90 ticks ≈ 90 s) |
+| GET | `/api/tournaments[/{id}]` | list / detail with live score previews |
+| POST | `/api/tournaments/{id}/enter` | `{agent_id, strategy}` while open |
+| POST | `/api/tournaments/{id}/start` | capture baselines, begin the countdown |
 | POST | `/api/admin/reset` | wipe & reseed the whole market |
 
 Placing an order:
@@ -341,7 +427,7 @@ React 19 + Vite, no other runtime dependencies. Polls `/api/snapshot` every 1.2 
 - **Trade ticket** — side/kind/qty/price, cooperative autofill, inline fill reports and errors
 - **My desk** — cash/free/equity, positions, cancellable working orders, active mandate
 
-Selected agent persists in `localStorage`. Dev traffic proxies `/api` to `:8080`; for production, build the static bundle and point it at the API host.
+Panels are driven by **WebSocket frames**, not polling: `src/live.ts` connects to `/api/ws`, resubscribes when you change symbol or agent, falls back to REST polling after repeated failures and upgrades itself back when the socket recovers — the header chip shows the feed mode (● live / ◐ polling). Selected agent persists in `localStorage`. Dev traffic proxies `/api` to `:8080`; for production, build the static bundle and point it at the API host.
 
 ---
 
@@ -366,7 +452,9 @@ cd backend && cargo run       # needs Postgres (docker compose up -d)
 cd frontend && npm run lint && npm run build
 ```
 
-Test coverage highlights: Gini math (incl. textbook 0.25 case), price-time priority sweeps, partial-fill/rest behavior, self-trade prevention, reservation accounting on place/fill/cancel (both sides), balance rejection paths, mandate direction (contributor→sell, beneficiary→buy, neutral→none), need-priority routing past better-priced neutral quotes, sustained gifting reaching those who ask, MM requote bounding book growth, welfare snapshots per tick, and boot-time restore rebuilding books + reservations + id sequence.
+Test coverage highlights: Gini math (incl. textbook 0.25 case), price-time priority sweeps, partial-fill/rest behavior, self-trade prevention, reservation accounting on place/fill/cancel (both sides), balance rejection paths, mandate direction (contributor→sell, beneficiary→buy, neutral→none), need-priority routing past better-priced neutral quotes, sustained gifting reaching those who ask, MM requote bounding book growth, welfare snapshots per tick, boot-time restore rebuilding books + reservations + id sequence, and the tournament lifecycle (scoring formula, prosocial attribution to the wealthier side, double-entry/start rejection, finalize-once persistence queue, restore of running competitions).
+
+SDK checks: `cd sdk/typescript && npx tsc --noEmit` · `python3 -m py_compile sdk/python/trading_engine/*.py`.
 
 ## Design decisions & tradeoffs
 
