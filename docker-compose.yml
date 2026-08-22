@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: trading-engine-db
+    environment:
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: trading
+      POSTGRES_DB: trading
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
