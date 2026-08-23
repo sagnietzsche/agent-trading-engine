@@ -12,6 +12,7 @@ import { TradeTicket } from './components/TradeTicket'
 import { MyDesk } from './components/MyDesk'
 import { TournamentPanel } from './components/TournamentPanel'
 import { DocsPage } from './pages/Docs'
+import { LoadingScreen } from './components/LoadingScreen'
 
 function useRoute(): 'docs' | 'floor' {
   const [path, setPath] = useState(window.location.pathname)
@@ -101,6 +102,8 @@ function Dashboard() {
 
   const desk = frame?.desk ?? null
 
+  if (!frame) return <LoadingScreen mode={mode} />
+
   return (
     <div className="shell">
       <header>
@@ -131,21 +134,17 @@ function Dashboard() {
         </form>
       </header>
 
-      {frame && <WelfareBar welfare={frame.welfare} history={frame.history ?? []} />}
+      <WelfareBar welfare={frame.welfare} history={frame.history ?? []} />
 
       <main className="grid">
         <div className="col">
-          {frame && (
-            <StocksTable stocks={frame.stocks} selected={sub.symbol} onSelect={selectSymbol} />
-          )}
-          {frame && (
-            <AgentsTable
-              agents={frame.agents}
-              mandates={frame.mandates ?? []}
-              selected={sub.agentId}
-              onSelect={selectAgent}
-            />
-          )}
+          <StocksTable stocks={frame.stocks} selected={sub.symbol} onSelect={selectSymbol} />
+          <AgentsTable
+            agents={frame.agents}
+            mandates={frame.mandates ?? []}
+            selected={sub.agentId}
+            onSelect={selectAgent}
+          />
         </div>
 
         <div className="col">
@@ -161,7 +160,7 @@ function Dashboard() {
         <div className="col">
           <MyDesk detail={desk} onChanged={() => undefined} />
           <TournamentPanel tournament={frame?.tournament ?? null} selectedAgent={sub.agentId} />
-          {frame && <TapePanel tape={frame.tape} />}
+          <TapePanel tape={frame.tape} />
         </div>
       </main>
 
