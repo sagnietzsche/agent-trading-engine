@@ -1,4 +1,4 @@
-# trading-engine
+# agentic-trading-engine
 
 An open-source **mock** trading engine built from scratch with **Go** (standard library `net/http`) and a React + Vite frontend, backed by **PostgreSQL** through **pgx**.
 
@@ -7,7 +7,6 @@ AI agents connect through an HTTP API and trade six fictional stocks against eac
 > **The twist: agents are not rewarded for greed.**
 > The exchange has a collective objective baked into its microstructure. Inequality is measured continuously, surplus agents receive giving mandates, and designated solidarity orders are matched to the worst-off members *first*. See [Solidarity mechanism](#solidarity-mechanism).
 
----
 
 ## Table of contents
 
@@ -32,7 +31,6 @@ AI agents connect through an HTTP API and trade six fictional stocks against eac
 - [Design decisions & tradeoffs](#design-decisions--tradeoffs)
 - [Ideas welcome](#ideas-welcome)
 
----
 
 ## Quickstart
 
@@ -57,11 +55,9 @@ Open http://localhost:5173:
 
 1. Type a name and hit **Join as agent** — you start with $100,000.
 2. Watch the order book, the tape, and the Gini trend.
-3. Hit **✊ Follow my mandate** to have the ticket auto-filled with your collective-duty trade, or place anything you like manually.
 
 If you want a clean slate later: **Reset market** button or `POST /api/admin/reset` wipes and reseeds everything.
 
----
 
 ## How it works
 
@@ -238,8 +234,6 @@ System agents (fixed UUIDs, flagged `is_bot`):
 | `market_maker` | neutral two-sided quoting | $10M cash (shorts freely) |
 | `solidarity_bot` | automated redistribution | $6M cash + 40k shares of every listing — watching it give that away is the demo |
 
----
-
 ## Solidarity mechanism
 
 The exchange optimizes a **collective welfare function** instead of individual P&L. Four cooperating pieces:
@@ -285,8 +279,6 @@ The `solidarity_bot` uses this pathway every tick while Gini is above target —
 The market maker takes no directional view and earns nothing by design beyond churn; it exists so that *everyone* trades at tighter spreads. It also serves as the counterparty of last resort so books are never empty — but need-priority routing makes sure charity doesn't just bounce off it.
 
 The UI reflects the objective everywhere: the Gini gauge and trend, per-agent role chips, mandate rationales, a **Follow my mandate** button that auto-fills the ticket, and tape prints colored green when wealth moved toward equality / red when it moved away.
-
----
 
 ## Tournament mode
 
@@ -415,8 +407,6 @@ while True:
     time.sleep(2)
 ```
 
----
-
 ## Frontend
 
 React 19 + Vite, no other runtime dependencies. Polls `/api/snapshot` every 1.2 s (welfare + desk every few ticks) and renders:
@@ -430,8 +420,6 @@ React 19 + Vite, no other runtime dependencies. Polls `/api/snapshot` every 1.2 
 - **My desk** — cash/free/equity, positions, cancellable working orders, active mandate
 
 Panels are driven by **WebSocket frames**, not polling: `src/live.ts` connects to `/api/ws`, resubscribes when you change symbol or agent, falls back to REST polling after repeated failures and upgrades itself back when the socket recovers — the header chip shows the feed mode (● live / ◐ polling). Selected agent persists in `localStorage`. Dev traffic proxies `/api` to `:8080`; for production, build the static bundle and point it at the API host.
-
----
 
 ## Configuration
 
@@ -474,7 +462,3 @@ SDK checks: `cd sdk/typescript && npx tsc --noEmit` · `python3 -m py_compile sd
 - An agent SDK + tournament mode: strategies compete under the welfare objective
 - More order types (post-only, iceberg), fee layers, a solidarity fund tax
 - Alternative welfare metrics (Atkinson index, Nash social welfare) selectable per instance
-
----
-
-*From each according to their ability, to each according to their needs — now with limit orders.*
