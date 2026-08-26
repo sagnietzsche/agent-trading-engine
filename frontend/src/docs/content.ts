@@ -207,32 +207,28 @@ export const WS_CLIENT_MESSAGES = `// choose what you receive — safe to resend
 
 export const CODEBASE_GUIDE: { file: string; role: string }[] = [
   {
-    file: 'backend/src/engine.rs',
+    file: 'backend/engine.go',
     role: 'The heart: pure, synchronous, database-free. Price-time priority books, reservation accounting, self-trade prevention, welfare/Gini math, mandate generation, need-priority matching for solidarity orders, tournament state & scoring, and the sim_tick() market simulation. Everything here is unit-tested without Postgres.',
   },
   {
-    file: 'backend/src/store.rs',
-    role: 'SeaORM persistence. connect/migrate/seed on boot; flush(pending) writes one mutation batch as a single transaction of idempotent upserts; boot_exchange rebuilds books from open orders and reloads running tournaments; save_tournament upserts competition rows.',
+    file: 'backend/store.go',
+    role: 'pgx persistence. connect/migrate/seed on boot; flush(pending) writes one mutation batch as a single transaction of idempotent upserts; boot_exchange rebuilds books from open orders and reloads running tournaments; save_tournament upserts competition rows.',
   },
   {
-    file: 'backend/src/api.rs',
-    role: 'HTTP layer. Thin handlers that lock the exchange, mutate, drain the pending buffer, unlock, then await the DB write. Maps engine errors to JSON responses.',
+    file: 'backend/api.go',
+    role: 'HTTP layer. Thin handlers that lock the exchange, mutate, drain the pending buffer, unlock, then run the DB write. Maps engine errors to JSON responses.',
   },
   {
-    file: 'backend/src/ws.rs',
-    role: 'WebSocket endpoint /api/ws. Two tasks per connection: a sender pushing LiveFrames every second and a receiver handling subscribe/ping messages. Subscription preferences are shared via a tiny Arc<Prefs>.',
+    file: 'backend/ws.go',
+    role: 'WebSocket endpoint /api/ws. Two goroutines per connection: a sender pushing LiveFrames every second and a receiver handling subscribe/ping messages. Subscription preferences are shared via a tiny mutex-guarded Prefs.',
   },
   {
-    file: 'backend/src/views.rs',
-    role: 'Read-models shared by REST and WS: leaderboards, desk views, and build_frame() which assembles the LiveFrame payload.',
+    file: 'backend/views.go',
+    role: 'Read-models shared by REST and WS: leaderboards, desk views, and BuildFrame() which assembles the LiveFrame payload.',
   },
   {
-    file: 'backend/src/entities/',
-    role: 'Hand-written SeaORM entity structs — one per table (agents, stocks, orders, trades, positions, welfare_snapshots, tournaments, tournament_entries).',
-  },
-  {
-    file: 'backend/migration/',
-    role: 'SeaORM migrations. Two so far: core schema (m1) and tournament tables (m2). Applied automatically at startup.',
+    file: 'backend/migrate.go',
+    role: 'SQL migrations (ported from the original SeaORM ones). Two steps: core schema (m1) and tournament tables (m2). Applied automatically at startup and tracked in schema_migrations.',
   },
   {
     file: 'frontend/src/live.ts',

@@ -3,5 +3,6 @@ node_modules/
 dist/
 target/
 backend/target/
+backend/backend
 *.log
 .DS_Store

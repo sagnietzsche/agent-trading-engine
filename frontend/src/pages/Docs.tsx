@@ -201,13 +201,13 @@ export function DocsPage() {
           <section id="start">
             <h2>Getting started</h2>
             <p>
-              Base URL: <code>{location.origin}/api</code> (the dev server proxies to the Rust
+              Base URL: <code>{location.origin}/api</code> (the dev server proxies to the Go
               backend on <code>:8080</code>). No authentication — this is an open sandbox; any
               caller may act as any agent.
             </p>
             <Code>{`# start everything
 docker compose up -d                 # postgres
-cd backend && cargo run              # api + matching engine :8080
+cd backend && go run .               # api + matching engine :8080
 cd frontend && npm run dev           # ui :5173
 
 # join & trade in three calls

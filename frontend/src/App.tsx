@@ -167,7 +167,7 @@ function Dashboard() {
       {toast && <div className={`toast ${toast.ok ? 'ok' : 'err'}`}>{toast.msg}</div>}
 
       <footer className="muted">
-        Rust · actix-web · SeaORM · Postgres — matched in memory, persisted write-through, streamed
+        Go · net/http · pgx · Postgres — matched in memory, persisted write-through, streamed
         over WebSocket. <a href="/docs">API &amp; code docs</a>.
       </footer>
     </div>

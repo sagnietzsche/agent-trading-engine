@@ -1,6 +1,6 @@
 # trading-engine
 
-An open-source **mock** trading engine built from scratch with Rust (**actix-web**) and a React + Vite frontend, backed by **PostgreSQL** through **SeaORM**.
+An open-source **mock** trading engine built from scratch with **Go** (standard library `net/http`) and a React + Vite frontend, backed by **PostgreSQL** through **pgx**.
 
 AI agents connect through an HTTP API and trade six fictional stocks against each other. There is no real money and no real-time market data — it is a playground for studying how trading agents behave.
 
@@ -36,7 +36,7 @@ AI agents connect through an HTTP API and trade six fictional stocks against eac
 
 ## Quickstart
 
-Prereqs: Docker (for Postgres only), Rust stable, Node 18+.
+Prereqs: Docker (for Postgres only), Go 1.22+, Node 18+.
 
 ```bash
 # 1. Start Postgres
@@ -47,7 +47,7 @@ cp .env.example .env
 
 # 3. Run the backend — migrations apply automatically on first boot,
 #    listings + system bots get seeded, and books open for business.
-cd backend && cargo run          # listens on :8080
+cd backend && go run .          # listens on :8080
 
 # 4. In another terminal, run the frontend
 cd frontend && npm install && npm run dev   # proxies /api -> :8080
@@ -69,14 +69,14 @@ If you want a clean slate later: **Reset market** button or `POST /api/admin/res
 
 ```
 ┌──────────┐  HTTP /api    ┌───────────────────────────────┐   write-through   ┌───────────┐
-│ frontend │ ────────────► │  actix-web                    │ ────────────────► │ Postgres  │
-│ react    │ ◄──────────── │  ├─ matching engine (in-mem)  │  (SeaORM)        │ via SeaORM│
+│ frontend │ ────────────► │  Go net/http                 │ ────────────────► │ Postgres  │
+│ react    │ ◄──────────── │  ├─ matching engine (in-mem)  │  (pgx)           │ via pgx   │
 └──────────┘  polling      │  ├─ welfare / mandates        │ ◄──────────────── │           │
                            │  └─ sim loop (1 s ticks)      │   boot-rebuild    └───────────┘
                            └───────────────────────────────┘
 ```
 
-- **Matching runs in memory** for speed. Each symbol has a price-time priority book. A `std::sync::Mutex` guards the whole exchange; request handlers mutate under the lock and release it before doing any async I/O.
+- **Matching runs in memory** for speed. Each symbol has a price-time priority book. A `sync.Mutex` guards the whole exchange; request handlers mutate under the lock and release it before doing any DB I/O.
 - **Postgres is the source of truth for accounts and history.** Every mutation produces a batched, transactional flush (`Pending` buffer → upserts). If a DB write fails the in-memory state stays consistent and the error is logged — the next mutation retries persistence.
 - **Crash-safe restart**: on boot the engine loads agents/positions/open orders from Postgres, rebuilds the books, recomputes cash reservations, resumes order-id sequencing, and keeps trading. Kill it mid-session; nothing is lost.
 - A background task ticks once per second: random-walk fair values, requote the market maker, fire solidarity flow, advance tournaments and append a welfare snapshot.
@@ -87,20 +87,17 @@ If you want a clean slate later: **Reset market** button or `POST /api/admin/res
 ```
 trading-engine/
 ├── docker-compose.yml          # postgres:17-alpine, port 5432, healthcheck
-├── .env.example                # DATABASE_URL / HOST / PORT / RUST_LOG
+├── .env.example                # DATABASE_URL / HOST / PORT / LOG_LEVEL
 ├── backend/
-│   ├── Cargo.toml              # actix-web 4 · sea-orm 1 · rand 0.9 · rust_decimal
-│   ├── migration/              # SeaORM migration crate
-│   │   └── src/m20260822_000001_init.rs
-│   └── src/
-│       ├── main.rs             # env, DB connect+migrate, boot/rebuild, sim loop, HttpServer
-│       ├── engine.rs           # PURE matching + welfare + tournaments (no DB) + unit tests
-│       ├── store.rs            # SeaORM: connect/migrate/seed/flush/boot-load/reset/history
-│       ├── api.rs              # HTTP handlers + DTOs + error mapping (incl. tournaments)
-│       ├── ws.rs               # /api/ws live frames (sender/receiver tasks per conn)
-│       ├── views.rs            # read-models shared by REST & WS + LiveFrame builder
-│       └── entities/           # one file per table (agents, stocks, orders, trades,
-│                               #  positions, welfare_snapshots)
+│   ├── go.mod                  # pgx 5 · coder/websocket · google/uuid · godotenv
+│   └── *.go
+│       ├── main.go             # env, DB connect+migrate, boot/rebuild, sim loop, http.Server
+│       ├── engine.go           # PURE matching + welfare + tournaments (no DB) + unit tests
+│       ├── store.go            # pgx: connect/migrate/seed/flush/boot-load/reset/history
+│       ├── api.go              # HTTP handlers + DTOs + error mapping (incl. tournaments)
+│       ├── ws.go               # /api/ws live frames (sender/receiver goroutines per conn)
+│       ├── views.go            # read-models shared by REST & WS + LiveFrame builder
+│       └── migrate.go          # SQL schema (ported from the original SeaORM migrations)
 ├── sdk/
 │   ├── python/                 # pip install -e sdk/python · trading-agent CLI
 │   │   ├── trading_engine/{client,ws,agent,cli}.py
@@ -127,7 +124,7 @@ trading-engine/
             └── MyDesk.tsx          # selected agent's balances/positions/open orders
 ```
 
-The key separation: **`engine.rs` is a pure, synchronous, database-free module.** Everything about matching and welfare is unit-testable without Postgres; `store.rs` translates between that world and SQL.
+The key separation: **`engine.go` is a pure, synchronous, database-free module.** Everything about matching and welfare is unit-testable without Postgres; `store.go` translates between that world and SQL.
 
 ### The matching engine
 
@@ -192,20 +189,23 @@ One `Pending` buffer accumulates everything an operation touched:
 - `trades` → new prints with welfare context
 - `snapshots` → welfare samples from sim ticks
 
-After the lock is released, `store::flush` writes it all in **one transaction** using `INSERT … ON CONFLICT DO UPDATE` upserts, so replays are idempotent. Handlers and the sim loop share the exact same pattern:
+After the lock is released, `store.flush` writes it all in **one transaction** using `INSERT … ON CONFLICT DO UPDATE` upserts, so replays are idempotent. Handlers and the sim loop share the exact same pattern:
 
-```rust
-let pending = { let mut ex = state.lock(); /* mutate */ ex.drain_pending() };
-store::flush(&state.db, &pending).await;
+```go
+ex := srv.ex.lock()      // lock the engine
+/* mutate */
+pending := ex.DrainPending()
+srv.ex.unlock()          // release before any DB I/O
+flush(ctx, db, &pending)
 ```
 
 On restart, `Exchange::restore(...)` rebuilds from rows: stocks, agent caches, positions; then open orders are replayed into books **sorted by id** (preserving time priority) and human cash/share reservations are recomputed from them. Stored `reserved_*` columns are treated as informational only — the recomputation is authoritative. System-bot resting quotes are skipped at load (they requote themselves on the first tick anyway).
 
-Money is `f64` inside the hot path but `NUMERIC(20,4)` (via `rust_decimal`) in Postgres; conversions happen only at the persistence boundary.
+Money is `float64` inside the hot path but `NUMERIC(20,4)` in Postgres; conversions happen only at the persistence boundary.
 
 ### Database schema
 
-Created by the initial SeaORM migration (`backend/migration/src/m20260822_000001_init.rs`):
+Created by the migration steps in `backend/migrate.go` (ported from the original SeaORM migrations):
 
 | Table | Columns | Notes |
 |---|---|---|
@@ -250,7 +250,7 @@ Agent equities are marked continuously and inequality is summarized with the [Gi
 gini = Σᵢ (2i − n − 1)·xᵢ / (n · Σ xⱼ)        (x sorted ascending, i = 1..n)
 ```
 
-`0` = everyone holds equal wealth, `1` = one agent owns everything. Every fill stores the equities involved and the post-trade Gini, so the tape itself becomes an inequality ledger. Knobs live at the top of `engine.rs`:
+`0` = everyone holds equal wealth, `1` = one agent owns everything. Every fill stores the equities involved and the post-trade Gini, so the tape itself becomes an inequality ledger. Knobs live at the top of `engine.go`:
 
 | Constant | Default | Meaning |
 |---|---|---|
@@ -433,22 +433,22 @@ Panels are driven by **WebSocket frames**, not polling: `src/live.ts` connects t
 
 ## Configuration
 
-Environment (loaded from `.env` via `dotenvy`):
+Environment (loaded from `.env` via `godotenv`):
 
 | Var | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | — (required) | e.g. `postgres://trading:trading@localhost:5432/trading` |
 | `HOST` | `127.0.0.1` | bind address |
 | `PORT` | `8080` | bind port |
-| `RUST_LOG` | `info` | logging filter |
+| `LOG_LEVEL` | `info` | logging filter |
 
 Engine tuning constants (recompile to change): `GINI_TARGET`, `ROLE_THRESHOLD`, `GIFT_RATE`, sim tick interval (1 s), MM quote levels/spread, starting cash, tape depth cap (400).
 
 ## Development
 
 ```bash
-cd backend && cargo test      # 14 engine unit tests — no database required
-cd backend && cargo run       # needs Postgres (docker compose up -d)
+cd backend && go test ./...   # 17 engine unit tests — no database required
+cd backend && go run .        # needs Postgres (docker compose up -d)
 cd frontend && npm run lint && npm run build
 ```
 
@@ -460,7 +460,7 @@ SDK checks: `cd sdk/typescript && npx tsc --noEmit` · `python3 -m py_compile sd
 
 - **In-memory hot path + durable ledger** mirrors how real exchanges work: matching latency doesn't pay a DB tax, but every state change is journaled. Consistency window: a crash between mutation and flush loses at most the last in-flight batch.
 - **Single global mutex** around the exchange. Trivially correct, plenty fast for a classroom of agents; sharding per symbol would be the obvious next scale step.
-- **`f64` in the engine, `NUMERIC(20,4)` at rest.** Prices are cent-rounded at entry and costs at settlement; float dust never reaches the ledger.
+- **`float64` in the engine, `NUMERIC(20,4)` at rest.** Prices are cent-rounded at entry and costs at settlement; float dust never reaches the ledger.
 - **No authentication.** Any caller may act as any `agent_id` — this is a research sandbox, not a venue.
 - **Humans can't short; system bots can.** Keeps user accounting intuitive while letting liquidity bots always quote.
 - **Bot orders are persisted like everyone else's**, so even resting quotes survive restarts; they're just excluded from reservation reconstruction.
