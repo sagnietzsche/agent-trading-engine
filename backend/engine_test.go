@@ -50,6 +50,129 @@ func TestGiniBasics(t *testing.T) {
 	}
 }
 
+func TestAtkinsonIndex(t *testing.T) {
+	if atkinsonIndex([]float64{5.0}, 0.5) != 0.0 {
+		t.Fatal("single value atkinson != 0")
+	}
+	if atkinsonIndex([]float64{100, 100, 100, 100}, 0.5) != 0.0 {
+		t.Fatal("equal atkinson != 0")
+	}
+	// [100,200,300,400] with ε = 0.5: A = 1 − [(Σ√(x/μ))/n]² ≈ 0.0556.
+	a := atkinsonIndex([]float64{400, 100, 300, 200}, 0.5)
+	if math.Abs(a-0.055586) > 1e-5 {
+		t.Fatalf("atkinson = %v, want ≈0.0556", a)
+	}
+	// Fully concentrated wealth: three members with nothing, one with all.
+	c := atkinsonIndex([]float64{0, 0, 0, 100}, 0.5)
+	if math.Abs(c-0.75) > 1e-9 {
+		t.Fatalf("concentrated atkinson = %v, want 0.75", c)
+	}
+	// A regressive transfer (poorer member loses, richer gains) raises the
+	// index: inequality measures must be Schur-convex.
+	before := atkinsonIndex([]float64{1, 2, 3, 4}, 0.5)
+	after := atkinsonIndex([]float64{1, 2, 2.5, 4.5}, 0.5)
+	if after <= before {
+		t.Fatalf("regressive transfer did not raise atkinson: %v -> %v", before, after)
+	}
+}
+
+func TestNashSocialWelfareAndDeficit(t *testing.T) {
+	// Perfect equality → geometric mean equals mean → deficit 0.
+	if d := nashDeficit([]float64{100, 100, 100, 100}); math.Abs(d) > 1e-12 {
+		t.Fatalf("equal nash deficit = %v, want 0", d)
+	}
+	if nashDeficit([]float64{5.0}) != 0.0 {
+		t.Fatal("single value nash deficit != 0")
+	}
+	// [100,200,300,400]: GM = (2.4e9)^(1/4) ≈ 221.34, mean = 250.
+	gm := nashSocialWelfare([]float64{400, 100, 300, 200})
+	if math.Abs(gm-221.336) > 1e-3 {
+		t.Fatalf("nash sw = %v, want ≈221.336", gm)
+	}
+	d := nashDeficit([]float64{400, 100, 300, 200})
+	if math.Abs(d-(1.0-221.336/250.0)) > 1e-4 {
+		t.Fatalf("nash deficit = %v, want ≈%v", d, 1.0-221.336/250.0)
+	}
+	// A single non-positive member collapses Nash social welfare to 0 →
+	// deficit pegs at 1 (max inequality).
+	if nashDeficit([]float64{0, 100, 100, 100}) != 1.0 {
+		t.Fatal("zero member should peg nash deficit at 1")
+	}
+	if nashSocialWelfare([]float64{0, 100, 100, 100}) != 0.0 {
+		t.Fatal("zero member should zero nash sw")
+	}
+	// Degenerate all-non-positive population is treated as equal (0).
+	if d := nashDeficit([]float64{0, 0, 0}); math.Abs(d) > 1e-12 {
+		t.Fatalf("all-zero population should read as equality, got %v", d)
+	}
+	// AM-GM: the deficit never goes negative.
+	for _, v := range [][]float64{{1, 2, 3}, {10, 10, 10}, {1, 100, 10000}} {
+		if d := nashDeficit(v); d < -1e-12 || d > 1.0+1e-12 {
+			t.Fatalf("nash deficit out of [0,1]: %v", d)
+		}
+	}
+}
+
+func TestInequalityDispatchesOnMetric(t *testing.T) {
+	vals := []float64{400, 100, 300, 200}
+	if inequality(vals, MetricGini) != gini(vals) {
+		t.Fatal("gini dispatch mismatch")
+	}
+	if inequality(vals, MetricAtkinson) != atkinsonIndex(vals, atkinsonEpsilon) {
+		t.Fatal("atkinson dispatch mismatch")
+	}
+	if inequality(vals, MetricNash) != nashDeficit(vals) {
+		t.Fatal("nash dispatch mismatch")
+	}
+	// Unknown/empty metric falls back to gini.
+	if inequality(vals, "") != gini(vals) {
+		t.Fatal("empty metric should fall back to gini")
+	}
+	// metricValue surfaces the raw Nash SW only for the nash metric.
+	if metricValue(vals, MetricNash, 0.5) != nashSocialWelfare(vals) {
+		t.Fatal("nash metric_value should be the geometric mean")
+	}
+	if metricValue(vals, MetricGini, 0.25) != 0.25 {
+		t.Fatal("gini metric_value should equal the index")
+	}
+}
+
+func TestExchangeUsesSelectedMetric(t *testing.T) {
+	ex := NewExchange(Listings, WithMetric(MetricNash))
+	ex.SeedSystemAgents()
+	ex.DrainPending()
+
+	w := ex.Welfare()
+	if w.Metric != MetricNash {
+		t.Fatalf("metric = %q, want nash", w.Metric)
+	}
+	marks := ex.Marks()
+	var eqs []float64
+	for _, a := range ex.Agents {
+		eqs = append(eqs, a.Equity(marks))
+	}
+	if math.Abs(w.Gini-nashDeficit(eqs)) > 1e-9 {
+		t.Fatalf("gini field = %v, want nash deficit %v", w.Gini, nashDeficit(eqs))
+	}
+	if math.Abs(w.MetricValue-nashSocialWelfare(eqs)) > 1e-9 {
+		t.Fatalf("metric_value = %v, want nsw %v", w.MetricValue, nashSocialWelfare(eqs))
+	}
+	if w.Gini > 1.0 || w.Gini < 0.0 {
+		t.Fatalf("nash deficit out of range: %v", w.Gini)
+	}
+
+	// A gini instance still reports the plain Gini coefficient.
+	ex2 := NewExchange(Listings, WithMetric(MetricGini))
+	ex2.SeedSystemAgents()
+	w2 := ex2.Welfare()
+	if w2.Metric != MetricGini {
+		t.Fatalf("metric = %q, want gini", w2.Metric)
+	}
+	if math.Abs(w2.MetricValue-gini(eqs)) > 1e-9 {
+		t.Fatalf("gini metric_value = %v, want %v", w2.MetricValue, gini(eqs))
+	}
+}
+
 func TestLimitCrossFullyFillsAtMakerPrice(t *testing.T) {
 	ex := testExchange()
 	clearBots(ex)

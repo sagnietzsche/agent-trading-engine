@@ -329,7 +329,9 @@ func agentValues(m map[uuid.UUID]AgentCache) []AgentCache {
 	return out
 }
 
-// bootExchange builds the in-memory exchange from whatever is in Postgres.
+// bootExchange builds the in-memory exchange from whatever is in Postgres,
+// using the process's WELFARE_METRIC env var (the metric is instance config,
+// not persisted state).
 func bootExchange(ctx context.Context, pool *pgxpool.Pool) (*Exchange, error) {
 	rows, err := loadRows(ctx, pool)
 	if err != nil {
@@ -340,6 +342,7 @@ func bootExchange(ctx context.Context, pool *pgxpool.Pool) (*Exchange, error) {
 	if err != nil {
 		return nil, err
 	}
+	state.Metric = welfareMetricFromEnv()
 	return Restore(state), nil
 }
 
@@ -737,14 +740,13 @@ func flush(ctx context.Context, pool *pgxpool.Pool, pending *Pending) error {
 
 	for _, s := range pending.Snapshots {
 		_, err := tx.Exec(ctx, `
-			INSERT INTO welfare_snapshots (gini, total_equity, mean_equity, ts)
-			VALUES ($1, $2, $3, $4)`,
-			s.Gini, s.TotalEquity, s.MeanEquity, mustParseTS(s.TS))
+			INSERT INTO welfare_snapshots (gini, metric, metric_value, total_equity, mean_equity, ts)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			s.Gini, string(s.Metric), s.MetricValue, s.TotalEquity, s.MeanEquity, mustParseTS(s.TS))
 		if err != nil {
 			return err
 		}
 	}
-
 	for i := range pending.TournamentsFinalized {
 		if err := saveTournament(ctx, tx, &pending.TournamentsFinalized[i]); err != nil {
 			return err
@@ -757,6 +759,8 @@ func flush(ctx context.Context, pool *pgxpool.Pool, pending *Pending) error {
 // WelfarePoint is one sample of the recent welfare trend.
 type WelfarePoint struct {
 	Gini        float64 `json:"gini"`
+	Metric      string  `json:"metric"`
+	MetricValue float64 `json:"metric_value"`
 	TotalEquity float64 `json:"total_equity"`
 	MeanEquity  float64 `json:"mean_equity"`
 	TS          string  `json:"ts"`
@@ -765,7 +769,7 @@ type WelfarePoint struct {
 // WelfareHistory returns the recent welfare trend, newest last, for charting.
 func welfareHistory(ctx context.Context, pool *pgxpool.Pool, limit int) ([]WelfarePoint, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT gini::float8, total_equity::float8, mean_equity::float8, ts
+		SELECT gini::float8, metric, COALESCE(metric_value::float8, gini::float8), total_equity::float8, mean_equity::float8, ts
 		FROM welfare_snapshots ORDER BY ts ASC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -775,7 +779,7 @@ func welfareHistory(ctx context.Context, pool *pgxpool.Pool, limit int) ([]Welfa
 	for rows.Next() {
 		var p WelfarePoint
 		var ts time.Time
-		if err := rows.Scan(&p.Gini, &p.TotalEquity, &p.MeanEquity, &ts); err != nil {
+		if err := rows.Scan(&p.Gini, &p.Metric, &p.MetricValue, &p.TotalEquity, &p.MeanEquity, &ts); err != nil {
 			return nil, err
 		}
 		p.TS = ts.UTC().Format(time.RFC3339Nano)

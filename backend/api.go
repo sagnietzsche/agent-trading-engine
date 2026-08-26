@@ -98,6 +98,13 @@ type createTournamentReq struct {
 	DurationTicks *uint32 `json:"duration_ticks"`
 }
 
+// resetReq is an optional body for POST /api/admin/reset: when a metric is
+// supplied the market is reseeded with that welfare metric selected (this is
+// how the TUI starts a session with the user's pick).
+type resetReq struct {
+	Metric *string `json:"metric"`
+}
+
 type enterTournamentReq struct {
 	AgentID  uuid.UUID `json:"agent_id"`
 	Strategy *string   `json:"strategy"`
@@ -124,7 +131,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/tournaments/{id}/enter", s.handleEnterTournament)
 	mux.HandleFunc("POST /api/tournaments/{id}/start", s.handleStartTournament)
 	mux.HandleFunc("POST /api/admin/reset", s.handleReset)
-	// WebSocket live feed. SDKs and the frontend connect to /api/ws; the
+	// WebSocket live feed. SDKs and the TUI connect to /api/ws; the
 	// bare /ws alias keeps compatibility with the original Rust mount.
 	mux.HandleFunc("GET /api/ws", s.handleWS)
 	mux.HandleFunc("GET /ws", s.handleWS)
@@ -403,6 +410,13 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
+	// Optional body: {"metric": "gini"|"atkinson"|"nash"}. An empty body
+	// keeps the current metric and just reseeds.
+	var req resetReq
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
 	// Make sure previously queued engine writes are durable before the tables
 	// are wiped — a stale async flush could otherwise resurrect old rows.
 	if s.flusher != nil {
@@ -423,6 +437,10 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 
 	ex := s.ex.lock()
 	*ex = *FreshSimulated()
+	if req.Metric != nil {
+		ex.metric = parseWelfareMetric(*req.Metric)
+	}
+	metric := string(ex.metric)
 	pending := ex.DrainPending()
 	s.ex.unlock()
 
@@ -433,7 +451,10 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 		s.flusher.drain(dctx)
 		cancel()
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "reset complete"})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "reset complete",
+		"metric": metric,
+	})
 }
 
 // ---- tournament handlers --------------------------------------------------

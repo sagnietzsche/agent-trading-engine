@@ -63,6 +63,8 @@ var migrationSteps = []string{
 	`CREATE TABLE IF NOT EXISTS welfare_snapshots (
 		id bigserial PRIMARY KEY,
 		gini numeric(10,6) NOT NULL,
+		metric text NOT NULL DEFAULT 'gini',
+		metric_value numeric(22,4) NOT NULL DEFAULT 0,
 		total_equity numeric(22,4) NOT NULL,
 		mean_equity numeric(20,4) NOT NULL,
 		ts timestamptz NOT NULL DEFAULT now()
@@ -93,6 +95,13 @@ var migrationSteps = []string{
 		finished_at timestamptz,
 		PRIMARY KEY (tournament_id, agent_id)
 	)`,
+	// m20260825_000003_welfare_metric
+	// The welfare statistic is an instance-level choice (WELFARE_METRIC env /
+	// TUI session picker); snapshots carry which metric produced them so a
+	// trend series is self-describing.
+	`ALTER TABLE welfare_snapshots ADD COLUMN IF NOT EXISTS metric text NOT NULL DEFAULT 'gini'`,
+	`ALTER TABLE welfare_snapshots ADD COLUMN IF NOT EXISTS metric_value numeric(22,4) NOT NULL DEFAULT 0`,
+	`UPDATE welfare_snapshots SET metric_value = gini WHERE metric_value = 0 AND gini <> 0`,
 }
 
 // migrate applies pending migration steps in order, tracking applied versions

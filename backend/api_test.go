@@ -112,10 +112,13 @@ func TestReadEndpointsJSONContract(t *testing.T) {
 		}
 	}
 	w := snap["welfare"].(map[string]any)
-	for _, k := range []string{"gini", "total_equity", "mean_equity", "gini_target"} {
+	for _, k := range []string{"gini", "metric", "metric_value", "total_equity", "mean_equity", "gini_target"} {
 		if _, ok := w[k]; !ok {
 			t.Fatalf("welfare missing key %q", k)
 		}
+	}
+	if w["metric"] != "gini" {
+		t.Fatalf("default welfare metric = %v, want gini", w["metric"])
 	}
 
 	// GET /api/trades — array.

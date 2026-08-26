@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,8 +18,10 @@ import (
 //
 // The exchange is not neutral: its stated objective is to move every agent
 // toward an equal share of total wealth ("from each according to ability,
-// to each according to needs"). When measured inequality (Gini) exceeds
-// GiniTarget, surplus agents are nudged into giving trades.
+// to each according to needs"). When measured inequality exceeds
+// GiniTarget, surplus agents are nudged into giving trades. Which inequality
+// statistic is used is an instance-level choice — see WelfareMetric and the
+// WELFARE_METRIC env var (or the TUI's session picker).
 const (
 	GiniTarget      = 0.20
 	RoleThreshold   = 0.10
@@ -29,6 +33,45 @@ const (
 	TournamentRetW  = 1.0
 	TournamentCoopW = 1.0
 )
+
+// WelfareMetric selects the collective-welfare statistic an exchange instance
+// optimizes around. Each one is summarized as an inequality index in [0,1]
+// (0 = perfectly equal shares, higher = more unequal), which is what the
+// solidarity machinery compares against GiniTarget.
+type WelfareMetric string
+
+const (
+	MetricGini     WelfareMetric = "gini"     // Gini coefficient (default)
+	MetricAtkinson WelfareMetric = "atkinson" // Atkinson index, ε = 0.5
+	MetricNash     WelfareMetric = "nash"     // Nash social welfare (geometric mean)
+)
+
+// parseWelfareMetric maps user input (env var, TUI picker, reset body) to a
+// metric; anything unrecognized falls back to the default.
+func parseWelfareMetric(s string) WelfareMetric {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "atkinson", "atk":
+		return MetricAtkinson
+	case "nash", "nsw":
+		return MetricNash
+	default:
+		return MetricGini
+	}
+}
+
+// welfareMetricFromEnv returns the metric configured for this process via the
+// WELFARE_METRIC env var (default gini).
+func welfareMetricFromEnv() WelfareMetric {
+	return parseWelfareMetric(os.Getenv("WELFARE_METRIC"))
+}
+
+// normalized resolves the zero value to the default metric.
+func (m WelfareMetric) normalized() WelfareMetric {
+	if m == "" {
+		return MetricGini
+	}
+	return m
+}
 
 var (
 	MarketMakerID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
@@ -294,10 +337,12 @@ type OrderRecord struct {
 }
 
 type WelfareSnapshot struct {
-	Gini        float64 `json:"gini"`
-	TotalEquity float64 `json:"total_equity"`
-	MeanEquity  float64 `json:"mean_equity"`
-	TS          string  `json:"ts"`
+	Gini        float64       `json:"gini"`
+	Metric      WelfareMetric `json:"metric"`
+	MetricValue float64       `json:"metric_value"`
+	TotalEquity float64       `json:"total_equity"`
+	MeanEquity  float64       `json:"mean_equity"`
+	TS          string        `json:"ts"`
 }
 
 // Pending ------------------------------------------------------------------
@@ -358,10 +403,12 @@ type Mandate struct {
 }
 
 type Welfare struct {
-	Gini        float64 `json:"gini"`
-	TotalEquity float64 `json:"total_equity"`
-	MeanEquity  float64 `json:"mean_equity"`
-	GiniTarget  float64 `json:"gini_target"`
+	Gini        float64       `json:"gini"`
+	Metric      WelfareMetric `json:"metric"`
+	MetricValue float64       `json:"metric_value"`
+	TotalEquity float64       `json:"total_equity"`
+	MeanEquity  float64       `json:"mean_equity"`
+	GiniTarget  float64       `json:"gini_target"`
 }
 
 // Gini coefficient over agent equities: 0 = perfectly equal, 1 = one agent
@@ -385,6 +432,102 @@ func gini(values []float64) float64 {
 		weighted += float64(2*(i+1)-n-1) * x
 	}
 	return math.Max(weighted/(float64(n)*total), 0.0)
+}
+
+// atkinsonEpsilon is the inequality-aversion parameter of the Atkinson index.
+// Smaller ε weights the poorest members of the distribution more heavily.
+const atkinsonEpsilon = 0.5
+
+// atkinsonIndex computes A_ε = 1 − [(1/n)Σᵢ (xᵢ/μ)^(1−ε)]^(1/(1−ε)) for ε ≠ 1.
+// Like Gini it lives in [0,1] with 0 = perfect equality, but the Atkinson
+// index is more sensitive to the bottom of the distribution: giving the
+// poorest agent a dollar reduces it more than the same dollar to a rich one.
+func atkinsonIndex(values []float64, epsilon float64) float64 {
+	n := len(values)
+	if n < 2 {
+		return 0.0
+	}
+	total := 0.0
+	for _, x := range values {
+		total += x
+	}
+	if total <= 0.0 {
+		return 0.0
+	}
+	mean := total / float64(n)
+	sum := 0.0
+	for _, x := range values {
+		// Clamp negatives to zero: a non-positive member pushes the index
+		// toward 1 (max inequality) instead of producing NaN.
+		v := math.Max(x, 0.0)
+		sum += math.Pow(v/mean, 1.0-epsilon)
+	}
+	return 1.0 - math.Pow(sum/float64(n), 1.0/(1.0-epsilon))
+}
+
+// nashSocialWelfare returns the geometric mean of agent equities — the Nash
+// social welfare, i.e. the per-capita product maximized by an egalitarian
+// planner. A single non-positive member collapses the product to 0.
+func nashSocialWelfare(values []float64) float64 {
+	n := len(values)
+	if n == 0 {
+		return 0.0
+	}
+	logSum := 0.0
+	for _, x := range values {
+		if x <= 0.0 {
+			return 0.0
+		}
+		logSum += math.Log(x)
+	}
+	return math.Exp(logSum / float64(n))
+}
+
+// nashDeficit normalizes Nash social welfare into the inequality index the
+// engine drives on: 1 − GM/mean ∈ [0,1), with 0 = every member holds the
+// mean share (the AM–GM inequality guarantees GM ≤ mean).
+func nashDeficit(values []float64) float64 {
+	n := len(values)
+	if n < 2 {
+		return 0.0
+	}
+	total := 0.0
+	for _, x := range values {
+		total += x
+	}
+	if total <= 0.0 {
+		return 0.0
+	}
+	gm := nashSocialWelfare(values)
+	if gm <= 0.0 {
+		return 1.0
+	}
+	return 1.0 - gm/(total/float64(n))
+}
+
+// inequality summarizes a distribution with the instance's chosen metric,
+// always expressed as an index in [0,1] where 0 = perfectly equal. This is
+// the number stored in Welfare.Gini (and trades' gini_after) regardless of
+// which metric produced it.
+func inequality(values []float64, m WelfareMetric) float64 {
+	switch m.normalized() {
+	case MetricAtkinson:
+		return atkinsonIndex(values, atkinsonEpsilon)
+	case MetricNash:
+		return nashDeficit(values)
+	default:
+		return gini(values)
+	}
+}
+
+// metricValue returns the headline value of the chosen metric itself: the
+// Atkinson index / Gini coefficient for those metrics, or the raw Nash
+// social welfare (geometric mean of equities) for Nash.
+func metricValue(values []float64, m WelfareMetric, ineq float64) float64 {
+	if m.normalized() == MetricNash {
+		return nashSocialWelfare(values)
+	}
+	return ineq
 }
 
 func roundCents(p float64) float64 {
@@ -481,6 +624,7 @@ type RestoreState struct {
 	Agents      []AgentCache
 	OpenOrders  []OrderRecord
 	Tournaments []Tournament
+	Metric      WelfareMetric
 	NextOrderID uint64
 }
 
@@ -497,6 +641,7 @@ type Exchange struct {
 	pending        Pending
 	Tournaments    []Tournament
 	WelfareHistory []WelfareSnapshot
+	metric         WelfareMetric
 }
 
 func newRNG() *rand.Rand {
@@ -512,7 +657,16 @@ func newRNG() *rand.Rand {
 	return rand.New(rand.NewPCG(s1, s2))
 }
 
-func NewExchange(listings [][3]any) *Exchange {
+// ExchangeOption tweaks a freshly built exchange (e.g. WithMetric).
+type ExchangeOption func(*Exchange)
+
+// WithMetric selects the welfare metric this exchange instance optimizes
+// around. Without it an instance defaults to MetricGini.
+func WithMetric(m WelfareMetric) ExchangeOption {
+	return func(ex *Exchange) { ex.metric = m.normalized() }
+}
+
+func NewExchange(listings [][3]any, opts ...ExchangeOption) *Exchange {
 	ex := &Exchange{
 		Symbols:     make([]SymbolState, 0, len(listings)),
 		bySymbol:    map[string]int{},
@@ -521,6 +675,10 @@ func NewExchange(listings [][3]any) *Exchange {
 		nextOrderID: 1,
 		rng:         newRNG(),
 		pending:     newPending(),
+		metric:      MetricGini,
+	}
+	for _, opt := range opts {
+		opt(ex)
 	}
 	for _, l := range listings {
 		symbol := l[0].(string)
@@ -542,9 +700,9 @@ func NewExchange(listings [][3]any) *Exchange {
 }
 
 // FreshSimulated returns a brand-new exchange with listings, system agents
-// and a live opening book.
+// and a live opening book, using the WELFARE_METRIC env var (default gini).
 func FreshSimulated() *Exchange {
-	ex := NewExchange(Listings)
+	ex := NewExchange(Listings, WithMetric(welfareMetricFromEnv()))
 	ex.SeedSystemAgents()
 	ex.SimTick()
 	return ex
@@ -560,6 +718,7 @@ func Restore(state RestoreState) *Exchange {
 		nextOrderID: state.NextOrderID,
 		rng:         newRNG(),
 		pending:     newPending(),
+		metric:      state.Metric.normalized(),
 	}
 	for _, info := range state.Stocks {
 		ex.bySymbol[info.Symbol] = len(ex.Symbols)
@@ -676,8 +835,11 @@ func (ex *Exchange) Welfare() Welfare {
 	if len(eqs) > 0 {
 		mean = total / float64(len(eqs))
 	}
+	ineq := inequality(eqs, ex.metric)
 	return Welfare{
-		Gini:        gini(eqs),
+		Gini:        ineq,
+		Metric:      ex.metric.normalized(),
+		MetricValue: metricValue(eqs, ex.metric, ineq),
 		TotalEquity: total,
 		MeanEquity:  mean,
 		GiniTarget:  GiniTarget,
@@ -1374,7 +1536,7 @@ func (ex *Exchange) execute(idx int, takerOrderID uint64, taker uuid.UUID, side 
 			for _, a := range ex.Agents {
 				eqs = append(eqs, a.Equity(marks))
 			}
-			return gini(eqs)
+			return inequality(eqs, ex.metric)
 		}()
 
 		trade := Trade{
@@ -1613,6 +1775,8 @@ func (ex *Exchange) SimTick() {
 	w = ex.Welfare()
 	snap := WelfareSnapshot{
 		Gini:        w.Gini,
+		Metric:      w.Metric,
+		MetricValue: w.MetricValue,
 		TotalEquity: w.TotalEquity,
 		MeanEquity:  w.MeanEquity,
 		TS:          time.Now().UTC().Format(time.RFC3339Nano),

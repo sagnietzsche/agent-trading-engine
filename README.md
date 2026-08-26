@@ -1,6 +1,6 @@
 # agentic-trading-engine
 
-An open-source **mock** trading engine built from scratch with **Go** (standard library `net/http`) and a React + Vite frontend, backed by **PostgreSQL** through **pgx**.
+An open-source **mock** trading engine built from scratch with **Go** (standard library `net/http`), watched through a **Bubble Tea terminal UI**, and backed by **PostgreSQL** through **pgx**.
 
 AI agents connect through an HTTP API and trade six fictional stocks against each other. There is no real money and no real-time market data — it is a playground for studying how trading agents behave.
 
@@ -25,7 +25,7 @@ AI agents connect through an HTTP API and trade six fictional stocks against eac
   - [Need-priority matching](#need-priority-matching)
   - [Neutral liquidity as a public good](#neutral-liquidity-as-a-public-good)
 - [API reference](#api-reference)
-- [Frontend](#frontend)
+- [Terminal UI](#terminal-ui)
 - [Configuration](#configuration)
 - [Development](#development)
 - [Design decisions & tradeoffs](#design-decisions--tradeoffs)
@@ -34,7 +34,7 @@ AI agents connect through an HTTP API and trade six fictional stocks against eac
 
 ## Quickstart
 
-Prereqs: Docker (for Postgres only), Go 1.22+, Node 18+.
+Prereqs: Docker (for Postgres only), Go 1.22+.
 
 ```bash
 # 1. Start Postgres
@@ -47,16 +47,17 @@ cp .env.example .env
 #    listings + system bots get seeded, and books open for business.
 cd backend && go run .          # listens on :8080
 
-# 4. In another terminal, run the frontend
-cd frontend && npm install && npm run dev   # proxies /api -> :8080
+# 4. In another terminal, run the TUI
+cd tui && go run .              # talks to :8080 over WebSocket
 ```
 
-Open http://localhost:5173:
+In the TUI:
 
-1. Type a name and hit **Join as agent** — you start with $100,000.
-2. Watch the order book, the tape, and the Gini trend.
+1. Pick a welfare metric — **Gini coefficient**, **Atkinson index (ε = 0.5)**, or **Nash social welfare** — with ↑/↓ and enter.
+2. If the server runs a different metric, the market reseeds under your choice, then the live floor renders: welfare gauge + trend, stocks, book, tape, and the leaderboard.
+3. Switch symbols with ←/→, re-pick the metric anytime with `r`.
 
-If you want a clean slate later: **Reset market** button or `POST /api/admin/reset` wipes and reseeds everything.
+If you want a clean slate later: `POST /api/admin/reset` wipes and reseeds everything (an optional `{"metric": …}` body also selects the welfare metric).
 
 
 ## How it works
@@ -65,9 +66,9 @@ If you want a clean slate later: **Reset market** button or `POST /api/admin/res
 
 ```
 ┌──────────┐  HTTP /api    ┌───────────────────────────────┐   write-through   ┌───────────┐
-│ frontend │ ────────────► │  Go net/http                 │ ────────────────► │ Postgres  │
-│ react    │ ◄──────────── │  ├─ matching engine (in-mem)  │  (pgx)           │ via pgx   │
-└──────────┘  polling      │  ├─ welfare / mandates        │ ◄──────────────── │           │
+│   TUI    │ ────────────► │  Go net/http                 │ ────────────────► │ Postgres  │
+│ bubbletea│ ◄──────────── │  ├─ matching engine (in-mem)  │  (pgx)           │ via pgx   │
+└──────────┘  WS frames    │  ├─ welfare / mandates        │ ◄──────────────── │           │
                            │  └─ sim loop (1 s ticks)      │   boot-rebuild    └───────────┘
                            └───────────────────────────────┘
 ```
@@ -101,23 +102,13 @@ trading-engine/
 │   └── typescript/             # npm run build (Node >=22, zero runtime deps)
 │       ├── src/{client,ws,strategies,agent}.ts
 │       └── examples/{mandate-bot,tournament-demo}.ts
-└── frontend/
-    ├── vite.config.ts          # dev proxy: /api -> http://127.0.0.1:8080
-    └── src/
-        ├── App.tsx             # routes /docs ↔ trading floor; frame-driven panels
-        ├── live.ts             # WebSocket client + polling fallback
-        ├── pages/Docs.tsx      # in-app API & code documentation at /docs
-        ├── docs/content.ts     # endpoint reference data for the docs page
-        ├── api.ts / types.ts / format.ts
-        ├── index.css / App.css # dark terminal theme
-        └── components/
-            ├── WelfareBar.tsx      # Gini gauge + mean equity + trend sparkline
-            ├── StocksTable.tsx     # listings w/ last/change/bid/ask
-            ├── BookLadder.tsx      # depth ladder with size bars
-            ├── TapePanel.tsx       # time & sales, colored by wealth direction
-            ├── AgentsTable.tsx     # leaderboard w/ roles
-            ├── TradeTicket.tsx     # order form + "Follow my mandate" autofill
-            └── MyDesk.tsx          # selected agent's balances/positions/open orders
+└── tui/
+    └── *.go                    # Go + Bubble Tea terminal client (own module)
+        ├── main.go             # entry: --backend flag / BACKEND_URL env
+        ├── model.go            # bubbletea state machine: metric picker → live floor
+        ├── view.go             # lipgloss panels: welfare, stocks, book, tape, agents
+        ├── client.go           # WS session: metric reseed + frame streaming + reconnect
+        └── *_test.go           # rendering + session integration tests
 ```
 
 The key separation: **`engine.go` is a pure, synchronous, database-free module.** Everything about matching and welfare is unit-testable without Postgres; `store.go` translates between that world and SQL.
@@ -173,7 +164,7 @@ Marking: an agent's **equity = cash + Σ position_qty × mark**, where mark is t
 
 Statuses persisted on every order row: `open` → `partially_filled` → `filled` | `cancelled`.
 
-Every fill produces a **trade record**: maker price, quantity, buyer, seller, taker order id, plus welfare context — both parties' equity just before settlement and the network-wide **Gini coefficient right after**.
+Every fill produces a **trade record**: maker price, quantity, buyer, seller, taker order id, plus welfare context — both parties' equity just before settlement and the network-wide **inequality index right after**, measured in whatever metric the instance has selected.
 
 ### Persistence model
 
@@ -210,9 +201,9 @@ Created by the migration steps in `backend/migrate.go` (ported from the original
 | `agents` | `id uuid pk, name, is_bot bool, cash numeric(20,4), reserved_cash numeric(20,4), created_at timestamptz` | reserved is informational after restarts |
 | `stocks` | `symbol text pk, name, fair numeric(20,4), prev_close numeric(20,4)` | seeded listing universe |
 | `orders` | `id bigint pk, agent_id fk→agents, symbol fk→stocks, side, kind, price numeric null, qty, filled, status, created_at` | indexes on agent_id and status |
-| `trades` | `id uuid pk, symbol fk→stocks, price, qty, buyer fk→agents, seller fk→agents, taker_order bigint fk→orders, buyer_equity, seller_equity, gini_after numeric(10,6), ts` | indexed `(symbol, ts)` |
+| `trades` | `id uuid pk, symbol fk→stocks, price, qty, buyer fk→agents, seller fk→agents, taker_order bigint fk→orders, buyer_equity, seller_equity, gini_after numeric(10,6), ts` | indexed `(symbol, ts)`; `gini_after` holds the instance's metric |
 | `positions` | `(agent_id, symbol) pk, qty int` | qty may be negative for system bots |
-| `welfare_snapshots` | `id bigserial pk, gini numeric(10,6), total_equity numeric(22,4), mean_equity numeric(20,4), ts` | one row per sim tick |
+| `welfare_snapshots` | `id bigserial pk, gini numeric(10,6), metric text, metric_value numeric(22,4), total_equity numeric(22,4), mean_equity numeric(20,4), ts` | one row per sim tick; `metric` self-describes the series |
 | `tournaments` | `id uuid pk, name, status, duration_ticks, ticks_left, gini_start numeric(10,6), gini_final null, created_at, started_at null, finished_at null` | competition sessions |
 | `tournament_entries` | `(tournament_id, agent_id) pk fk→agents, strategy, start_equity, total_volume, prosocial_volume, return_pct null, coop_share null, score null, finished_at null` | enrolled strategies & results |
 
@@ -224,8 +215,8 @@ A spawned task runs `sim_tick()` every second:
 
 1. **Random walk** each symbol's fair value: small drift `U(-0.0015, +0.002)` plus a fat-tailed shock (cubed uniform noise), clamped to sane bounds.
 2. **Requote the market maker** — cancels all of its resting quotes, then posts 3 bid + 3 ask levels around fair value with spread `max(fair × 0.0015, $0.01)` and randomized sizes (20–90 shares). Cancel-then-repost keeps books bounded.
-3. **Solidarity flow** — while measured Gini exceeds the target, the `solidarity_bot` executes its own giving mandate as a *solidarity order* (see below).
-4. **Snapshot welfare** (Gini, total equity, mean equity) into `welfare_snapshots` — this feeds the frontend trend sparkline and `/api/welfare` history.
+3. **Solidarity flow** — while measured inequality (in the instance's metric) exceeds the target, the `solidarity_bot` executes its own giving mandate as a *solidarity order* (see below).
+4. **Snapshot welfare** (inequality index, metric, total equity, mean equity) into `welfare_snapshots` — this feeds the TUI trend sparkline and `/api/welfare` history.
 
 System agents (fixed UUIDs, flagged `is_bot`):
 
@@ -240,17 +231,29 @@ The exchange optimizes a **collective welfare function** instead of individual P
 
 ### Welfare math
 
-Agent equities are marked continuously and inequality is summarized with the [Gini coefficient](https://en.wikipedia.org/wiki/Gini_coefficient) over the population:
+Agent equities are marked continuously and inequality is summarized with one of **three selectable metrics** over the population. The instance's choice — the TUI session picker, or the `WELFARE_METRIC` env var at boot — drives every downstream number: mandates, the tape's per-fill context, snapshots, and tournament bookends, so a session's whole ledger speaks the same statistic.
+
+**Gini coefficient** (default):
 
 ```
 gini = Σᵢ (2i − n − 1)·xᵢ / (n · Σ xⱼ)        (x sorted ascending, i = 1..n)
 ```
 
-`0` = everyone holds equal wealth, `1` = one agent owns everything. Every fill stores the equities involved and the post-trade Gini, so the tape itself becomes an inequality ledger. Knobs live at the top of `engine.go`:
+**Atkinson index** (ε = 0.5):
+
+```
+A = 1 − [(1/n)Σᵢ (xᵢ/μ)^(1−ε)]^(1/(1−ε))
+```
+
+More sensitive to the poorest members than Gini: a dollar to the worst-off agent lowers it more than the same dollar to a rich one.
+
+**Nash social welfare**: the geometric mean of equities, `NSW = (∏xᵢ)^(1/n)`. It is normalized into the same inequality framing as the other two: `deficit = 1 − NSW/μ ∈ [0,1)`, with `0` = everyone holds the mean (that's the AM–GM inequality). The API surfaces the raw `NSW` as `metric_value` alongside the deficit.
+
+For every metric, `0` = everyone holds equal wealth, `1` = one agent owns everything. Every fill stores the equities involved and the post-trade index, so the tape itself becomes an inequality ledger. Knobs live at the top of `engine.go`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `GINI_TARGET` | `0.20` | above this, redistribution flow activates |
+| `GINI_TARGET` | `0.20` | above this, redistribution flow activates (for whichever metric is selected) |
 | `ROLE_THRESHOLD` | `0.10` | ±deviation-from-mean that assigns a role |
 | `GIFT_RATE` | `0.05` | fraction of one's wealth gap offered per mandate |
 
@@ -262,7 +265,7 @@ gini = Σᵢ (2i − n − 1)·xᵢ / (n · Σ xⱼ)        (x sorted ascending,
 - **Beneficiary** (>10% below mean) → *receive*: use up to 5% of your shortfall to acquire assets **at the ask**, sized to what your free cash affords.
 - **Neutral** (within ±10%) → hold steady; no suggestion issued.
 
-Each suggestion carries a plain-language rationale ("You hold +42.1% vs the mean…"), which the frontend surfaces verbatim.
+Each suggestion carries a plain-language rationale ("You hold +42.1% vs the mean…"), which the TUI surfaces verbatim.
 
 This endpoint is deliberately shaped as a hook: a future autonomous agent's entire strategy can be *"poll my mandate and comply"* — or not, and then watch what inequality does.
 
@@ -272,13 +275,13 @@ Ordinary orders match by strict price-time priority. Orders placed through `plac
 
 Consequence: a gift can't be intercepted by a better-priced neutral quote or by the market maker. When a poor member has a resting buy, solidarity supply lands on *them*.
 
-The `solidarity_bot` uses this pathway every tick while Gini is above target — it sells its inventory into the bids of the worst-off members, converting its surplus into their assets. Its endowment is deliberately large so the giving is visible.
+The `solidarity_bot` uses this pathway every tick while measured inequality (in the instance's metric) is above target — it sells its inventory into the bids of the worst-off members, converting its surplus into their assets. Its endowment is deliberately large so the giving is visible.
 
 ### Neutral liquidity as a public good
 
 The market maker takes no directional view and earns nothing by design beyond churn; it exists so that *everyone* trades at tighter spreads. It also serves as the counterparty of last resort so books are never empty — but need-priority routing makes sure charity doesn't just bounce off it.
 
-The UI reflects the objective everywhere: the Gini gauge and trend, per-agent role chips, mandate rationales, a **Follow my mandate** button that auto-fills the ticket, and tape prints colored green when wealth moved toward equality / red when it moved away.
+The TUI reflects the objective everywhere: the metric's headline value vs target plus trend sparkline, per-agent role chips, and tape prints colored ▲ green when wealth moved toward equality / ▼ red when it moved away.
 
 ## Tournament mode
 
@@ -298,7 +301,7 @@ A fill is *prosocial* for whichever side is WEALTHIER:
 Cooperation can fully offset a modest loss, so a pure profit-maximizer loses to a strategy that
 trades with poorer members. Lifecycle: **create → enter (while open) → start → runs N sim ticks
 (~1 s each) → finalize** — scores are persisted and running tournaments survive restarts.
-Watch it live on the dashboard or via the WS frame's `tournament` field.
+Watch it live via the WS frame's `tournament` field.
 
 ## Agent SDKs
 
@@ -340,12 +343,6 @@ await agent.run(new MandateStrategy(), { durationMs: 60_000 })
 
 Pit `--strategy mandate` against `--strategy greedy` in one tournament and watch cooperation beat greed on the scoreboard.
 
-## In-app documentation
-
-The frontend serves a full reference at **`/docs`** — every endpoint with runnable try-it buttons,
-the WebSocket protocol with a live frame console, tournament scoring rules, SDK snippets, and a
-file-by-file codebase guide.
-
 ## API reference
 
 All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"}`.
@@ -355,7 +352,7 @@ All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"
 | GET | `/api/health` | liveness + database connectivity |
 | GET | `/api/ws?symbol=&agent_id=` | **WebSocket upgrade**: snapshot frames every ~1 s; client sends `{type:"subscribe",…}` |
 | GET | `/api/snapshot?symbol=NOVA` | aggregate poll: welfare, stocks, book, last 40 trades, agents, active tournament |
-| GET | `/api/welfare` | Gini stats, target, mandates for every agent, recent history (≤90 pts) |
+| GET | `/api/welfare` | welfare stats for the selected metric (`gini`/`atkinson`/`nash`, incl. raw `metric_value`), target, mandates for every agent, recent history (≤90 pts) |
 | GET | `/api/stocks` | listings with last/bid/ask/change |
 | GET | `/api/book/{symbol}?levels=10` | aggregated depth ladder |
 | GET | `/api/trades?limit=50&symbol=` | recent tape (newest first, ≤400) |
@@ -368,7 +365,7 @@ All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"
 | GET | `/api/tournaments[/{id}]` | list / detail with live score previews |
 | POST | `/api/tournaments/{id}/enter` | `{agent_id, strategy}` while open |
 | POST | `/api/tournaments/{id}/start` | capture baselines, begin the countdown |
-| POST | `/api/admin/reset` | wipe & reseed the whole market |
+| POST | `/api/admin/reset` | wipe & reseed the whole market; optional body `{"metric": "gini"|"atkinson"|"nash"}` selects the welfare metric |
 
 Placing an order:
 
@@ -407,19 +404,18 @@ while True:
     time.sleep(2)
 ```
 
-## Frontend
+## Terminal UI
 
-React 19 + Vite, no other runtime dependencies. Polls `/api/snapshot` every 1.2 s (welfare + desk every few ticks) and renders:
+The browser frontend is replaced by a **Go + Bubble Tea** terminal client (`tui/`, its own module). It connects to the running engine over the same WebSocket feed the SDKs use.
 
-- **Welfare bar** — Gini vs target, mean equity, inequality sparkline
-- **Market table** — click a symbol to switch the book
-- **Book ladder** — depth bars, spread readout
-- **Time & sales** — colored by wealth direction, tooltips show parties + post-trade Gini
-- **Agents** — leaderboard with role chips; click to inspect someone's desk
-- **Trade ticket** — side/kind/qty/price, cooperative autofill, inline fill reports and errors
-- **My desk** — cash/free/equity, positions, cancellable working orders, active mandate
+- **Session start** — a picker asks which welfare metric the session should optimize: Gini coefficient, Atkinson index (ε = 0.5), or Nash social welfare. If the server runs a different metric, the TUI reseeds the market via `POST /api/admin/reset {"metric": …}` and the floor rebuilds under the chosen metric.
+- **Welfare bar** — the metric's headline value vs the solidarity target, mean equity, and a block-char inequality sparkline from the in-memory history.
+- **Stocks** — listings with last / change% / bid / ask.
+- **Book ladder** — depth for the selected symbol with size bars and a spread readout.
+- **Time & sales** — last prints colored ▲ green when wealth moved to a poorer agent, ▼ red when it moved to a richer one.
+- **Agents** — leaderboard with role chips (contributor / beneficiary / neutral).
 
-Panels are driven by **WebSocket frames**, not polling: `src/live.ts` connects to `/api/ws`, resubscribes when you change symbol or agent, falls back to REST polling after repeated failures and upgrades itself back when the socket recovers — the header chip shows the feed mode (● live / ◐ polling). Selected agent persists in `localStorage`. Dev traffic proxies `/api` to `:8080`; for production, build the static bundle and point it at the API host.
+Keys: `←/→` switch symbol, `r` re-pick the metric (starts a fresh session), `q` / `ctrl+c` quit. `--backend` flag or `BACKEND_URL` env points it at the API (default `http://127.0.0.1:8080`). Frames are pushed once per second; a dropped connection reconnects automatically, with the status line reflecting the feed state.
 
 ## Configuration
 
@@ -431,20 +427,19 @@ Environment (loaded from `.env` via `godotenv`):
 | `HOST` | `127.0.0.1` | bind address |
 | `PORT` | `8080` | bind port |
 | `LOG_LEVEL` | `info` | logging filter |
+| `WELFARE_METRIC` | `gini` | welfare statistic for the instance: `gini` \| `atkinson` \| `nash` (overridable per session via the TUI / reset) |
 
 Engine tuning constants (recompile to change): `GINI_TARGET`, `ROLE_THRESHOLD`, `GIFT_RATE`, sim tick interval (1 s), MM quote levels/spread, starting cash, tape depth cap (400).
 
 ## Development
 
 ```bash
-cd backend && go test ./...   # 17 engine unit tests — no database required
+cd backend && go test ./...   # engine + API unit tests — no database required
 cd backend && go run .        # needs Postgres (docker compose up -d)
-cd frontend && npm run lint && npm run build
+cd tui && go test ./...       # rendering + session integration tests
 ```
 
-Test coverage highlights: Gini math (incl. textbook 0.25 case), price-time priority sweeps, partial-fill/rest behavior, self-trade prevention, reservation accounting on place/fill/cancel (both sides), balance rejection paths, mandate direction (contributor→sell, beneficiary→buy, neutral→none), need-priority routing past better-priced neutral quotes, sustained gifting reaching those who ask, MM requote bounding book growth, welfare snapshots per tick, boot-time restore rebuilding books + reservations + id sequence, and the tournament lifecycle (scoring formula, prosocial attribution to the wealthier side, double-entry/start rejection, finalize-once persistence queue, restore of running competitions).
-
-SDK checks: `cd sdk/typescript && npx tsc --noEmit` · `python3 -m py_compile sdk/python/trading_engine/*.py`.
+Test coverage highlights: Gini / Atkinson / Nash math (incl. the textbook Gini 0.25 case), price-time priority sweeps, partial-fill/rest behavior, self-trade prevention, reservation accounting on place/fill/cancel (both sides), balance rejection paths, mandate direction (contributor→sell, beneficiary→buy, neutral→none), need-priority routing past better-priced neutral quotes, sustained gifting reaching those who ask, MM requote bounding book growth, welfare snapshots per tick, boot-time restore rebuilding books + reservations + id sequence, and the tournament lifecycle (scoring formula, prosocial attribution to the wealthier side, double-entry/start rejection, finalize-once persistence queue, restore of running competitions).
 
 ## Design decisions & tradeoffs
 
@@ -454,11 +449,12 @@ SDK checks: `cd sdk/typescript && npx tsc --noEmit` · `python3 -m py_compile sd
 - **No authentication.** Any caller may act as any `agent_id` — this is a research sandbox, not a venue.
 - **Humans can't short; system bots can.** Keeps user accounting intuitive while letting liquidity bots always quote.
 - **Bot orders are persisted like everyone else's**, so even resting quotes survive restarts; they're just excluded from reservation reconstruction.
-- **Polling, not WebSockets**, keeps the stack simple; the snapshot endpoint is already shaped like a pub/sub payload if you want to add SSE/WS later.
+- **The TUI is a client, not a fork.** It watches the running engine through the same HTTP + WebSocket API the SDKs use, so scripts and the terminal always see the same market — and the metric choice is a session property, applied by reseeding when needed, rather than a recompile.
 
 ## Ideas welcome
 
-- WebSocket/SSE streaming instead of polling
-- An agent SDK + tournament mode: strategies compete under the welfare objective
+- ~~Alternative welfare metrics (Atkinson index, Nash social welfare) selectable per instance~~ ✅ shipped — pick one in the TUI
+- ~~A terminal UI in place of the browser frontend~~ ✅ shipped — Go + Bubble Tea, metric picker at session start
 - More order types (post-only, iceberg), fee layers, a solidarity fund tax
-- Alternative welfare metrics (Atkinson index, Nash social welfare) selectable per instance
+- Trade from the TUI: join as an agent, auto-fill the ticket with your mandate, place orders with the keyboard
+- Tournament panels in the TUI: a live scoreboard while a competition runs
