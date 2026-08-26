@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -559,6 +561,104 @@ func mustParseTS(s string) time.Time {
 		return time.Now().UTC()
 	}
 	return t
+}
+
+// FlushTimeout bounds each write batch; a slow database degrades the writer
+// instead of the request path.
+const flushTimeout = 10 * time.Second
+
+// ---- async writer -----------------------------------------------------------
+
+// flushJob is one unit of work for the background writer. A non-nil done
+// channel turns the job into a barrier used by drain to wait until every
+// previously submitted job has been persisted.
+type flushJob struct {
+	pending *Pending
+	done    chan struct{}
+}
+
+// flusher serializes all engine writes onto a single background goroutine so
+// request handlers never pay a synchronous Postgres round-trip. Jobs are
+// processed FIFO, which preserves the order the engine drained them in.
+type flusher struct {
+	mu     sync.Mutex
+	ch     chan flushJob
+	closed bool
+	done   chan struct{}
+}
+
+func newFlusher(buf int) *flusher {
+	return &flusher{ch: make(chan flushJob, buf), done: make(chan struct{})}
+}
+
+func (f *flusher) start(db *pgxpool.Pool) {
+	go func() {
+		defer close(f.done)
+		for job := range f.ch {
+			fctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+			err := flush(fctx, db, job.pending)
+			cancel()
+			if err != nil {
+				slog.Error("async flush failed", "err", err)
+			}
+			if job.done != nil {
+				close(job.done)
+			}
+		}
+	}()
+}
+
+// submit queues a drained pending batch for persistence. It blocks when the
+// writer is saturated (backpressure) and returns false once the flusher has
+// been stopped.
+func (f *flusher) submit(pending *Pending) bool {
+	if pending.isEmpty() {
+		return true
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed {
+		return false
+	}
+	f.ch <- flushJob{pending: pending}
+	return true
+}
+
+// drain blocks until every job submitted before the call has been persisted.
+// Used by /api/admin/reset so a stale queued batch can't resurrect rows after
+// the tables are wiped.
+func (f *flusher) drain(ctx context.Context) bool {
+	done := make(chan struct{})
+	p := newPending()
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return true
+	}
+	f.ch <- flushJob{pending: &p, done: done}
+	f.mu.Unlock()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// stop closes the queue and waits (bounded) for the writer to drain whatever
+// is left before the database pool closes.
+func (f *flusher) stop(timeout time.Duration) {
+	f.mu.Lock()
+	if !f.closed {
+		f.closed = true
+		close(f.ch)
+	}
+	f.mu.Unlock()
+	select {
+	case <-f.done:
+	case <-time.After(timeout):
+		slog.Warn("flusher did not drain in time")
+	}
 }
 
 // Flush is the write-through persistence for everything the engine mutated in

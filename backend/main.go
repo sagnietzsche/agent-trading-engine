@@ -21,10 +21,11 @@ const simInterval = time.Second
 
 type pgxPool = pgxpool.Pool
 
-// lockedExchange guards the matching engine. The in-memory state stays
-// internally consistent because Go cannot corrupt plain structs.
+// lockedExchange guards the matching engine. Writers (order placement, sim
+// ticks) take the exclusive lock; read-model builders (REST reads, WS frame
+// assembly) take the shared lock so many clients can read concurrently.
 type lockedExchange struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 	ex *Exchange
 }
 
@@ -35,6 +36,15 @@ func (l *lockedExchange) lock() *Exchange {
 
 func (l *lockedExchange) unlock() {
 	l.mu.Unlock()
+}
+
+func (l *lockedExchange) rlock() *Exchange {
+	l.mu.RLock()
+	return l.ex
+}
+
+func (l *lockedExchange) runlock() {
+	l.mu.RUnlock()
 }
 
 // logInfo is a tiny structured logger shim used across the package.
@@ -90,12 +100,16 @@ func main() {
 	slog.Info("restored %d listings, %d agents from postgres", "listings", len(exchange.Symbols), "agents", len(exchange.Agents))
 
 	srv := &server{
-		ctx: ctx,
-		db:  db,
-		ex:  &lockedExchange{ex: exchange},
+		ctx:     ctx,
+		db:      db,
+		ex:      &lockedExchange{ex: exchange},
+		flusher: newFlusher(512),
 	}
+	srv.flusher.start(db)
 
 	// Market simulation: random-walk fairs, neutral MM quotes, solidarity flow.
+	// Writes are batched to the background flusher so the tick never blocks on
+	// Postgres.
 	go func() {
 		ticker := time.NewTicker(simInterval)
 		defer ticker.Stop()
@@ -109,9 +123,7 @@ func main() {
 			ex.SimTick()
 			pending := ex.DrainPending()
 			srv.ex.unlock()
-			if err := flush(ctx, db, &pending); err != nil {
-				slog.Error("simulation flush failed", "err", err)
-			}
+			srv.submitFlush(&pending)
 		}
 	}()
 
@@ -125,10 +137,10 @@ func main() {
 	}
 	addr := host + ":" + port
 
-	srv.ex.lock()
+	srv.ex.rlock()
 	nSymbols := len(srv.ex.ex.Symbols)
 	nAgents := len(srv.ex.ex.Agents)
-	srv.ex.unlock()
+	srv.ex.runlock()
 
 	slog.Info("trading engine listening on http://%s (%d listings, %d agents)", "addr", addr, "listings", nSymbols, "agents", nAgents)
 
@@ -136,18 +148,25 @@ func main() {
 		Addr:              addr,
 		Handler:           srv.routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
+		// Drain whatever engine writes are still queued before the pool closes.
+		srv.flusher.stop(15 * time.Second)
 	}()
 
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("server failed", "err", err)
 		os.Exit(1)
 	}
+	<-shutdownDone
 }
 
 func setupLogging() {

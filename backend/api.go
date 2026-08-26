@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,12 +16,34 @@ import (
 
 const healthTimeout = 2 * time.Second
 
-// server holds the shared state: the exchange (guarded by a mutex) and the
-// database pool.
+// server holds the shared state: the exchange (guarded by an RWMutex), the
+// database pool, the WebSocket broadcast hub and the async persistence writer.
 type server struct {
-	ctx context.Context
-	db  *pgxPool
-	ex  *lockedExchange
+	ctx     context.Context
+	db      *pgxPool
+	ex      *lockedExchange
+	hub     *wsHub
+	hubOnce sync.Once
+	flusher *flusher
+}
+
+// hubFor lazily creates the WebSocket hub; tests construct servers without
+// one and the once guards concurrent first connections.
+func (s *server) hubFor() *wsHub {
+	s.hubOnce.Do(func() {
+		if s.hub == nil {
+			s.hub = newWSHub(s.ctx, s.ex)
+		}
+	})
+	return s.hub
+}
+
+// submitFlush hands a drained pending batch to the background writer. Servers
+// without a flusher (tests) simply drop the batch.
+func (s *server) submitFlush(pending *Pending) {
+	if s.flusher != nil {
+		s.flusher.submit(pending)
+	}
 }
 
 // ---- DTOs -----------------------------------------------------------------
@@ -166,9 +189,9 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleStocks(w http.ResponseWriter, r *http.Request) {
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	views := ex.StockViews()
-	s.ex.unlock()
+	s.ex.runlock()
 	writeJSON(w, http.StatusOK, views)
 }
 
@@ -186,9 +209,9 @@ func (s *server) handleBook(w http.ResponseWriter, r *http.Request) {
 	if levels > 50 {
 		levels = 50
 	}
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	view := ex.BookView(symbol, levels)
-	s.ex.unlock()
+	s.ex.runlock()
 	if view == nil {
 		writeError(w, http.StatusNotFound, "unknown symbol: "+symbol)
 		return
@@ -211,9 +234,9 @@ func (s *server) handleTrades(w http.ResponseWriter, r *http.Request) {
 	}
 	sym := r.URL.Query().Get("symbol")
 
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	tape := ex.Tape(limit)
-	s.ex.unlock()
+	s.ex.runlock()
 
 	var out []Trade
 	if sym == "" {
@@ -245,9 +268,7 @@ func (s *server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	pending := ex.DrainPending()
 	s.ex.unlock()
 
-	if err := flush(s.ctx, s.db, &pending); err != nil {
-		slog.Error("flush failed", "err", err)
-	}
+	s.submitFlush(&pending)
 	writeJSON(w, http.StatusCreated, createAgentResp{
 		AgentID:      id,
 		Name:         name,
@@ -256,9 +277,9 @@ func (s *server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleListAgents(w http.ResponseWriter, r *http.Request) {
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	rows := Summaries(ex)
-	s.ex.unlock()
+	s.ex.runlock()
 	writeJSON(w, http.StatusOK, rows)
 }
 
@@ -268,9 +289,9 @@ func (s *server) handleAgentDetail(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid agent id")
 		return
 	}
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	detail := BuildAgentDetail(ex, id)
-	s.ex.unlock()
+	s.ex.runlock()
 	if detail == nil {
 		writeError(w, http.StatusNotFound, "unknown agent")
 		return
@@ -299,21 +320,19 @@ func (s *server) handlePlaceOrder(w http.ResponseWriter, r *http.Request) {
 	pending := ex.DrainPending()
 	s.ex.unlock()
 
-	if err := flush(s.ctx, s.db, &pending); err != nil {
-		slog.Error("flush failed", "err", err)
-	}
+	s.submitFlush(&pending)
 
 	if perr != nil {
 		writeError(w, http.StatusBadRequest, placeErrorMessage(perr))
 		return
 	}
 
-	ex = s.ex.lock()
+	ex = s.ex.rlock()
 	freeCash := 0.0
 	if a, ok := ex.Agents[req.AgentID]; ok {
 		freeCash = a.FreeCash()
 	}
-	s.ex.unlock()
+	s.ex.runlock()
 
 	writeJSON(w, http.StatusCreated, placeOrderResp{
 		Order:    *rec,
@@ -339,9 +358,7 @@ func (s *server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 	pending := ex.DrainPending()
 	s.ex.unlock()
 
-	if err := flush(s.ctx, s.db, &pending); err != nil {
-		slog.Error("flush failed", "err", err)
-	}
+	s.submitFlush(&pending)
 	if cerr != nil {
 		writeError(w, http.StatusBadRequest, cerr.Error())
 		return
@@ -350,10 +367,10 @@ func (s *server) handleCancelOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleWelfare(w http.ResponseWriter, r *http.Request) {
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	welf := ex.Welfare()
 	mandates := ex.Mandates()
-	s.ex.unlock()
+	s.ex.runlock()
 
 	history, err := welfareHistory(s.ctx, s.db, 90)
 	if err != nil {
@@ -372,7 +389,7 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	if symbol == "" {
 		symbol = "NOVA"
 	}
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	resp := snapshotResp{
 		Welfare:    ex.Welfare(),
 		Stocks:     ex.StockViews(),
@@ -381,11 +398,18 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		Agents:     Summaries(ex),
 		Tournament: ex.ActiveTournamentView(),
 	}
-	s.ex.unlock()
+	s.ex.runlock()
 	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
+	// Make sure previously queued engine writes are durable before the tables
+	// are wiped — a stale async flush could otherwise resurrect old rows.
+	if s.flusher != nil {
+		dctx, cancel := context.WithTimeout(r.Context(), flushTimeout)
+		s.flusher.drain(dctx)
+		cancel()
+	}
 	if err := resetAll(s.ctx, s.db); err != nil {
 		slog.Error("reset failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "reset failed: "+err.Error())
@@ -402,8 +426,12 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 	pending := ex.DrainPending()
 	s.ex.unlock()
 
-	if err := flush(s.ctx, s.db, &pending); err != nil {
-		slog.Error("flush after reset failed", "err", err)
+	s.submitFlush(&pending)
+	// Respond only once the fresh state is on disk.
+	if s.flusher != nil {
+		dctx, cancel := context.WithTimeout(r.Context(), flushTimeout)
+		s.flusher.drain(dctx)
+		cancel()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reset complete"})
 }
@@ -445,9 +473,9 @@ func (s *server) handleCreateTournament(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *server) handleListTournaments(w http.ResponseWriter, r *http.Request) {
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	views := ex.TournamentViews()
-	s.ex.unlock()
+	s.ex.runlock()
 	writeJSON(w, http.StatusOK, views)
 }
 
@@ -457,9 +485,9 @@ func (s *server) handleGetTournament(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid tournament id")
 		return
 	}
-	ex := s.ex.lock()
+	ex := s.ex.rlock()
 	view := ex.TournamentView(id)
-	s.ex.unlock()
+	s.ex.runlock()
 	if view == nil {
 		writeError(w, http.StatusNotFound, "tournament not found")
 		return

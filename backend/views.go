@@ -175,7 +175,10 @@ type LiveFrame struct {
 	Desk       *AgentDetail      `json:"desk,omitempty"`
 }
 
-func BuildFrame(ex *Exchange, symbol string, agentID *uuid.UUID, extended bool, seq uint64) LiveFrame {
+// BuildBaseFrame builds the shared part of a live frame for one symbol — the
+// broadcast hub assembles this once per subscribed symbol per tick, then fans
+// the marshaled bytes out to every client watching that symbol.
+func BuildBaseFrame(ex *Exchange, symbol string, extended bool, seq uint64) LiveFrame {
 	frame := LiveFrame{
 		Type:       "snapshot",
 		Seq:        seq,
@@ -190,6 +193,13 @@ func BuildFrame(ex *Exchange, symbol string, agentID *uuid.UUID, extended bool, 
 	if extended {
 		frame.Mandates = ex.Mandates()
 	}
+	return frame
+}
+
+// BuildFrame builds a complete per-client frame: the shared snapshot plus the
+// client's own desk when it subscribed with an agent_id.
+func BuildFrame(ex *Exchange, symbol string, agentID *uuid.UUID, extended bool, seq uint64) LiveFrame {
+	frame := BuildBaseFrame(ex, symbol, extended, seq)
 	if agentID != nil {
 		frame.Desk = BuildAgentDetail(ex, *agentID)
 	}

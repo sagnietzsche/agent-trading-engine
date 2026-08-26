@@ -76,11 +76,11 @@ If you want a clean slate later: **Reset market** button or `POST /api/admin/res
                            └───────────────────────────────┘
 ```
 
-- **Matching runs in memory** for speed. Each symbol has a price-time priority book. A `sync.Mutex` guards the whole exchange; request handlers mutate under the lock and release it before doing any DB I/O.
-- **Postgres is the source of truth for accounts and history.** Every mutation produces a batched, transactional flush (`Pending` buffer → upserts). If a DB write fails the in-memory state stays consistent and the error is logged — the next mutation retries persistence.
+- **Matching runs in memory** for speed. Each symbol has a price-time priority book. A `sync.RWMutex` guards the whole exchange: order placement and sim ticks take the exclusive lock, while read-model builders (REST reads, WS frame assembly) share the read lock so many clients can read concurrently.
+- **Postgres is the source of truth for accounts and history.** Every mutation produces a batched, transactional flush (`Pending` buffer → upserts) that is handed to a **single background writer** — handlers never pay a synchronous DB round-trip. If a DB write fails the in-memory state stays consistent and the error is logged; the next mutation retries persistence.
 - **Crash-safe restart**: on boot the engine loads agents/positions/open orders from Postgres, rebuilds the books, recomputes cash reservations, resumes order-id sequencing, and keeps trading. Kill it mid-session; nothing is lost.
 - A background task ticks once per second: random-walk fair values, requote the market maker, fire solidarity flow, advance tournaments and append a welfare snapshot.
-- **WebSocket streaming**: `/api/ws` pushes a full snapshot frame every second; the frontend renders straight off those frames (with automatic polling fallback if the socket dies).
+- **WebSocket streaming**: a broadcast hub assembles one snapshot frame **per subscribed symbol per tick** (plus a per-client desk for `agent_id` subscribers) and fans the marshaled bytes out to every connection — the per-tick cost is O(symbols + desks), not O(clients). Slow consumers get frames dropped, never the whole feed stalled.
 
 ### Project layout
 
@@ -95,7 +95,7 @@ trading-engine/
 │       ├── engine.go           # PURE matching + welfare + tournaments (no DB) + unit tests
 │       ├── store.go            # pgx: connect/migrate/seed/flush/boot-load/reset/history
 │       ├── api.go              # HTTP handlers + DTOs + error mapping (incl. tournaments)
-│       ├── ws.go               # /api/ws live frames (sender/receiver goroutines per conn)
+│       ├── ws.go               # /api/ws broadcast hub (one frame per symbol per tick)
 │       ├── views.go            # read-models shared by REST & WS + LiveFrame builder
 │       └── migrate.go          # SQL schema (ported from the original SeaORM migrations)
 ├── sdk/
@@ -189,15 +189,17 @@ One `Pending` buffer accumulates everything an operation touched:
 - `trades` → new prints with welfare context
 - `snapshots` → welfare samples from sim ticks
 
-After the lock is released, `store.flush` writes it all in **one transaction** using `INSERT … ON CONFLICT DO UPDATE` upserts, so replays are idempotent. Handlers and the sim loop share the exact same pattern:
+After the lock is released, the batch is handed to a **single background writer** (`flusher`), which serializes everything into `store.flush` — one transaction per batch using `INSERT … ON CONFLICT DO UPDATE` upserts, so replays are idempotent. Handlers and the sim loop share the exact same pattern:
 
 ```go
-ex := srv.ex.lock()      // lock the engine
+ex := srv.ex.lock()      // lock the engine (write lock)
 /* mutate */
 pending := ex.DrainPending()
 srv.ex.unlock()          // release before any DB I/O
-flush(ctx, db, &pending)
+srv.submitFlush(&pending) // background writer persists it FIFO
 ```
+
+Read-only handlers take the shared read lock (`rlock`/`runlock`), so `/api/stocks`, `/api/book`, `/api/snapshot` and the WS hub all serve clients concurrently. `POST /api/admin/reset` drains the writer before wiping tables so a stale queued batch can't resurrect old rows.
 
 On restart, `Exchange::restore(...)` rebuilds from rows: stocks, agent caches, positions; then open orders are replayed into books **sorted by id** (preserving time priority) and human cash/share reservations are recomputed from them. Stored `reserved_*` columns are treated as informational only — the recomputation is authoritative. System-bot resting quotes are skipped at load (they requote themselves on the first tick anyway).
 
@@ -459,7 +461,7 @@ SDK checks: `cd sdk/typescript && npx tsc --noEmit` · `python3 -m py_compile sd
 ## Design decisions & tradeoffs
 
 - **In-memory hot path + durable ledger** mirrors how real exchanges work: matching latency doesn't pay a DB tax, but every state change is journaled. Consistency window: a crash between mutation and flush loses at most the last in-flight batch.
-- **Single global mutex** around the exchange. Trivially correct, plenty fast for a classroom of agents; sharding per symbol would be the obvious next scale step.
+- **One engine, one writer, many readers.** Matching stays single-threaded behind an exclusive lock (order-book engines are inherently sequential — sharding per symbol would be the next scale step), but every read path shares the lock via `RWMutex`, the WebSocket feed assembles frames once per symbol instead of once per client, and persistence runs on a dedicated background writer. The hot path is CPU- and memory-bound, not DB- or lock-bound.
 - **`float64` in the engine, `NUMERIC(20,4)` at rest.** Prices are cent-rounded at entry and costs at settlement; float dust never reaches the ledger.
 - **No authentication.** Any caller may act as any `agent_id` — this is a research sandbox, not a venue.
 - **Humans can't short; system bots can.** Keeps user accounting intuitive while letting liquidity bots always quote.
