@@ -15,7 +15,7 @@ func main() {
 		*base = env
 	}
 
-	m := &Model{base: *base, subCh: make(chan string, 4)}
+	m := &Model{base: *base, subCh: make(chan string, 4), announceCh: make(chan string, 4)}
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	m.send = p.Send // the session goroutine streams frames into the program
 

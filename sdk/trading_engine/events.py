@@ -157,7 +157,10 @@ class Event:
         if "levels" in raw:
             out["levels"] = _as_int(raw, "levels", "event.liquidity", 0, 100)
         if "size_multiplier" in raw:
-            out["size_multiplier"] = _as_float(raw, "size_multiplier", "event.liquidity", 0.0, 1.0)
+            v = _as_float(raw, "size_multiplier", "event.liquidity", 0.0, 1.0)
+            if v <= 0.0:
+                raise EventError("event.liquidity.size_multiplier: expected a number in (0, 1]")
+            out["size_multiplier"] = v
         return out
 
     @staticmethod

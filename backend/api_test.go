@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -106,11 +108,18 @@ func TestReadEndpointsJSONContract(t *testing.T) {
 
 	// GET /api/snapshot — full aggregate shape.
 	snap := getObj(t, ts, "/api/snapshot?symbol=NOVA", 200)
-	for _, k := range []string{"welfare", "stocks", "book", "tape", "agents", "tournament"} {
+	for _, k := range []string{"welfare", "stocks", "book", "tape", "agents", "tournament", "chat"} {
 		if _, ok := snap[k]; !ok {
 			t.Fatalf("snapshot missing key %q", k)
 		}
 	}
+
+	// GET /api/chat — the floor chatroom (seeded agents chatter on boot).
+	chat := getJSON(t, ts, "/api/chat?limit=10", 200)
+	if msgs, ok := chat.([]any); !ok || len(msgs) == 0 {
+		t.Fatalf("chat: expected non-empty message list, got %v", chat)
+	}
+
 	w := snap["welfare"].(map[string]any)
 	for _, k := range []string{"gini", "metric", "metric_value", "total_equity", "mean_equity", "gini_target"} {
 		if _, ok := w[k]; !ok {
@@ -135,6 +144,91 @@ func TestReadEndpointsJSONContract(t *testing.T) {
 	errResp := getObj(t, ts, "/api/book/NOPE", 404)
 	if errResp["error"] == nil {
 		t.Fatal("expected error body on unknown symbol")
+	}
+}
+
+func TestChatSayAndAnnounce(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	// Register a real agent.
+	var agentID string
+	{
+		resp, err := ts.Client().Post(ts.URL+"/api/agents", "application/json", strings.NewReader(`{"name":"chatty"}`))
+		if err != nil {
+			t.Fatalf("create agent: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create agent = %d: %s", resp.StatusCode, body)
+		}
+		var created map[string]any
+		if err := json.Unmarshal(body, &created); err != nil {
+			t.Fatal(err)
+		}
+		agentID = created["agent_id"].(string)
+	}
+
+	// POST /api/chat as that agent.
+	resp, err := ts.Client().Post(ts.URL+"/api/chat", "application/json",
+		strings.NewReader(fmt.Sprintf(`{"agent_id":"%s","text":" hello floor! "}`, agentID)))
+	if err != nil {
+		t.Fatalf("say: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("say = %d: %s", resp.StatusCode, body)
+	}
+	var said map[string]any
+	if err := json.Unmarshal(body, &said); err != nil {
+		t.Fatal(err)
+	}
+	if said["name"] != "chatty" || said["text"] != "hello floor!" {
+		t.Fatalf("say response = %v", said)
+	}
+
+	// The message shows up in the feed, newest first.
+	chat := getJSON(t, ts, "/api/chat?limit=5", 200).([]any)
+	if len(chat) == 0 || chat[0].(map[string]any)["text"] != "hello floor!" {
+		t.Fatalf("chat feed = %v", chat)
+	}
+
+	// An announcement draws scripted replies from the system agents.
+	resp, err = ts.Client().Post(ts.URL+"/api/admin/announce", "application/json",
+		strings.NewReader(`{"text":"Everyone give 5% of your wealth"}`))
+	if err != nil {
+		t.Fatalf("announce: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("announce = %d: %s", resp.StatusCode, body)
+	}
+	var posted []map[string]any
+	if err := json.Unmarshal(body, &posted); err != nil {
+		t.Fatal(err)
+	}
+	var sawBotReply bool
+	for _, m := range posted {
+		if m["name"] == "solidarity_bot" || m["name"] == "market_maker" {
+			sawBotReply = true
+		}
+	}
+	if !sawBotReply {
+		t.Fatalf("announce drew no bot reply: %v", posted)
+	}
+
+	// Unknown agent cannot chat.
+	resp, err = ts.Client().Post(ts.URL+"/api/chat", "application/json",
+		strings.NewReader(`{"agent_id":"11111111-1111-1111-1111-111111111111","text":"nope"}`))
+	if err != nil {
+		t.Fatalf("say unknown: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown-agent say = %d, want 400", resp.StatusCode)
 	}
 }
 

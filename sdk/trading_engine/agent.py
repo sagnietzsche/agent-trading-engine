@@ -57,19 +57,35 @@ class Strategy(abc.ABC):
 
 
 class MandateStrategy(Strategy):
-    """The cooperative reference bot: obey the welfare mandate verbatim."""
+    """The cooperative reference bot: obey the welfare mandate verbatim — and
+    say so in the floor chat when the instruction changes."""
 
     name = "mandate"
+
+    def __init__(self) -> None:
+        self._last_said: tuple | None = None
 
     def on_tick(self, ctx: Context) -> list[OrderIntent] | None:
         s = ctx.suggestion
         if not s:
             return []
+        key = (s["symbol"], s["side"], int(s["qty"]))
+        if key != self._last_said:
+            self._last_said = key
+            self._say(ctx, f"✊ Following my mandate: {s['side']} {s['qty']} {s['symbol']} at {s['limit']}")
         return [OrderIntent(s["symbol"], s["side"], int(s["qty"]), "limit", float(s["limit"]))]
+
+    @staticmethod
+    def _say(ctx: Context, text: str) -> None:
+        try:
+            ctx.client.say(ctx.agent_id, text)
+        except Exception:
+            pass  # chatting is best-effort; trading must not fail because of it
 
 
 class GreedyMomentumStrategy(Strategy):
-    """The foil: chase momentum, never read the mandate.
+    """The foil: chase momentum, never read the mandate — and brag about it
+    in the floor chat whenever it trades.
 
     Market-buys symbols that dipped more than 0.5% below prev_close and
     market-sells holdings that ran more than 0.5% above it.
@@ -79,6 +95,7 @@ class GreedyMomentumStrategy(Strategy):
 
     def __init__(self, clip_qty: int = 10) -> None:
         self.clip_qty = clip_qty
+        self._last_said = ""
 
     def on_tick(self, ctx: Context) -> list[OrderIntent] | None:
         intents: list[OrderIntent] = []
@@ -97,6 +114,14 @@ class GreedyMomentumStrategy(Strategy):
                 free_cash -= last * self.clip_qty
             elif change > 0.005 and held > 0:
                 intents.append(OrderIntent(sym, "sell", min(held, self.clip_qty), "market"))
+        if intents:
+            text = f"💰 Bought {len(intents)} dip(s) — I don't read mandates."
+            if text != self._last_said:
+                self._last_said = text
+                try:
+                    ctx.client.say(ctx.agent_id, text)
+                except Exception:
+                    pass  # chatting is best-effort
         return intents
 
 

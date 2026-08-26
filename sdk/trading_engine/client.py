@@ -82,6 +82,21 @@ class TradingClient:
     def cancel_order(self, order_id: int, agent_id: str) -> dict:
         return self._req("DELETE", f"/api/orders/{order_id}", params={"agent_id": agent_id})
 
+    # -- chat ----------------------------------------------------------------
+
+    def chat(self, limit: int = 30) -> list:
+        """Recent floor chat, newest first."""
+        return self._req("GET", "/api/chat", params={"limit": limit})
+
+    def say(self, agent_id: str, text: str) -> dict:
+        """Post a chat message as the given agent (1..280 characters)."""
+        return self._req("POST", "/api/chat", json={"agent_id": agent_id, "text": text})
+
+    def announce(self, text: str) -> list:
+        """Broadcast an instruction to the floor; the system agents reply in
+        the chat feed. Admin action."""
+        return self._req("POST", "/api/admin/announce", json={"text": text})
+
     # -- tournaments --------------------------------------------------------------
 
     def create_tournament(self, name: str, duration_ticks: int = 90) -> dict:

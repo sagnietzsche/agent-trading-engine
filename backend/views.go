@@ -170,6 +170,7 @@ type LiveFrame struct {
 	Agents     []AgentSummary    `json:"agents"`
 	Welfare    Welfare           `json:"welfare"`
 	Tournament *TournamentView   `json:"tournament"`
+	Chat       []ChatMessage     `json:"chat"`
 	Mandates   []Mandate         `json:"mandates,omitempty"`
 	History    []WelfareSnapshot `json:"history,omitempty"`
 	Desk       *AgentDetail      `json:"desk,omitempty"`
@@ -189,6 +190,12 @@ func BuildBaseFrame(ex *Exchange, symbol string, extended bool, seq uint64) Live
 		Welfare:    ex.Welfare(),
 		Tournament: ex.ActiveTournamentView(),
 		History:    ex.WelfareHistory,
+	}
+	if n := len(ex.Chat); n > 0 {
+		if n > 30 {
+			n = 30
+		}
+		frame.Chat = ex.Chat[:n]
 	}
 	if extended {
 		frame.Mandates = ex.Mandates()

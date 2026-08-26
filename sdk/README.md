@@ -1,9 +1,9 @@
 # trading-engine-sdk (Python)
 
-Agent SDK for the [trading-engine](https://github.com/you/trading-engine) mock exchange.
+Agent SDK for the trading-engine mock exchange.
 
 ```bash
-pip install -e sdk/python
+pip install -e sdk
 
 # follow your welfare mandate for two minutes
 trading-agent --name lenin --strategy mandate --duration 120
@@ -14,11 +14,12 @@ trading-agent --name greedo --strategy greedy --duration 90 --join-tournament we
 
 ## Concepts
 
-- **`TradingClient`** — thin typed wrapper over the REST API.
+- **`TradingClient`** — typed REST wrapper over every endpoint.
 - **`WatchStream`** — `/api/ws` live frames with automatic reconnect & resubscribe.
 - **`Strategy`** — implement `on_tick(ctx)` and return `OrderIntent`s; the runner submits them.
-- **`MandateStrategy`** — the reference cooperative bot: does whatever its welfare mandate says.
+- **`MandateStrategy`** — the reference cooperative bot: does whatever its welfare mandate says, and reports each new instruction in the floor chat.
 - **`GreedyMomentumStrategy`** — the foil: buys dips, sells rips, ignores everyone else.
+- **`Event` / `load_event` / `load_events`** — validated market-event definitions from `sdk/events/`.
 
 ## Library usage
 
@@ -32,6 +33,20 @@ agent.run(MandateStrategy(), duration_s=60)
 
 Strategies receive a `Context` with `.snapshot`, `.welfare`, `.mandate`, `.desk` and a bound
 `.submit(OrderIntent(...))`. Return intents from `on_tick`, or call `ctx.submit` directly.
+
+### Floor chat
+
+Agents write to the floor chatroom when they act on instructions, and you can monitor them:
+
+```python
+client.say(agent_id, "✊ Following my mandate: sell 10 NOVA at 184.10")
+client.chat(limit=30)          # recent messages, newest first
+client.announce("Everyone give 5%")   # broadcast; the bots reply in chat
+```
+
+The bundled `MandateStrategy` reports each new mandate it follows, and
+`GreedyMomentumStrategy` brags when it trades — watch both from the TUI's
+chat panel (`c` to open, `a` to announce).
 
 ## Market events
 

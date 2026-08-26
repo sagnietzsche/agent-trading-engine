@@ -60,6 +60,7 @@ type snapshotResp struct {
 	Tape       []Trade         `json:"tape"`
 	Agents     []AgentSummary  `json:"agents"`
 	Tournament *TournamentView `json:"tournament"`
+	Chat       []ChatMessage   `json:"chat"`
 }
 
 type welfareResp struct {
@@ -91,6 +92,15 @@ type placeOrderResp struct {
 	Order    OrderRecord `json:"order"`
 	Fills    []Fill      `json:"fills"`
 	FreeCash float64     `json:"free_cash"`
+}
+
+type chatReq struct {
+	AgentID uuid.UUID `json:"agent_id"`
+	Text    string    `json:"text"`
+}
+
+type announceReq struct {
+	Text string `json:"text"`
 }
 
 type createTournamentReq struct {
@@ -125,6 +135,9 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/orders/{id}", s.handleCancelOrder)
 	mux.HandleFunc("GET /api/welfare", s.handleWelfare)
 	mux.HandleFunc("GET /api/snapshot", s.handleSnapshot)
+	mux.HandleFunc("GET /api/chat", s.handleListChat)
+	mux.HandleFunc("POST /api/chat", s.handleSay)
+	mux.HandleFunc("POST /api/admin/announce", s.handleAnnounce)
 	mux.HandleFunc("POST /api/tournaments", s.handleCreateTournament)
 	mux.HandleFunc("GET /api/tournaments", s.handleListTournaments)
 	mux.HandleFunc("GET /api/tournaments/{id}", s.handleGetTournament)
@@ -405,8 +418,69 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		Agents:     Summaries(ex),
 		Tournament: ex.ActiveTournamentView(),
 	}
+	if n := len(ex.Chat); n > 0 {
+		if n > 30 {
+			n = 30
+		}
+		resp.Chat = ex.Chat[:n]
+	}
 	s.ex.runlock()
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *server) handleListChat(w http.ResponseWriter, r *http.Request) {
+	limit := 30
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	ex := s.ex.rlock()
+	var out []ChatMessage
+	if n := len(ex.Chat); n > 0 {
+		if n > limit {
+			n = limit
+		}
+		out = ex.Chat[:n]
+	}
+	s.ex.runlock()
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *server) handleSay(w http.ResponseWriter, r *http.Request) {
+	var req chatReq
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	ex := s.ex.lock()
+	msg, err := ex.Say(req.AgentID, req.Text)
+	s.ex.unlock()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, msg)
+}
+
+func (s *server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
+	var req announceReq
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	ex := s.ex.lock()
+	posted, err := ex.Announce(req.Text)
+	s.ex.unlock()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, posted)
 }
 
 func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
@@ -441,6 +515,8 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 		ex.metric = parseWelfareMetric(*req.Metric)
 	}
 	metric := string(ex.metric)
+	ex.postChat(uuid.Nil, "floor", "system",
+		fmt.Sprintf("🔁 Market reseeded — session now runs on the %s metric", metric))
 	pending := ex.DrainPending()
 	s.ex.unlock()
 

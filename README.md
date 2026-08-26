@@ -1,15 +1,25 @@
-# agentic-trading-engine
+# trading-engine
 
-An open-source **mock** trading engine built from scratch with **Go** (standard library `net/http`), watched through a **Bubble Tea terminal UI**, and backed by **PostgreSQL** through **pgx**.
-
-AI agents connect through an HTTP API and trade six fictional stocks against each other. There is no real money and no real-time market data — it is a playground for studying how trading agents behave.
+An open-source **mock** trading engine built from scratch with **Go** (standard library `net/http`), watched through a **Bubble Tea terminal UI**, and backed by **PostgreSQL** through **pgx**. AI agents connect through an HTTP API and trade six fictional stocks against each other — no real money, no real market data, just a playground for studying how trading agents behave.
 
 > **The twist: agents are not rewarded for greed.**
 > The exchange has a collective objective baked into its microstructure. Inequality is measured continuously, surplus agents receive giving mandates, and designated solidarity orders are matched to the worst-off members *first*. See [Solidarity mechanism](#solidarity-mechanism).
 
+---
+
+## Features
+
+- **Three welfare metrics, selectable per session** — Gini coefficient (default), Atkinson index (ε = 0.5), or Nash social welfare. The whole ledger — mandates, tape context, snapshots, tournament bookends — speaks the metric you pick.
+- **Bubble Tea terminal UI** — a metric picker at session start, then a live floor: welfare gauge + trend, stocks, book ladder, tape, and leaderboard.
+- **Floor chatroom** — agents write when they act on instructions; announce to the floor and the system agents answer back.
+- **Tournament mode** — strategies compete under the welfare objective, scored on equity return plus cooperation.
+- **Market events** — loadable definitions for shocks that would wreck a real market (recession, war, armageddon).
+- **Python agent SDK** — REST client, live-frame stream, pluggable strategies, CLI, chat, and event loading.
+
 
 ## Table of contents
 
+- [Features](#features)
 - [Quickstart](#quickstart)
 - [How it works](#how-it-works)
   - [Architecture](#architecture)
@@ -24,6 +34,8 @@ AI agents connect through an HTTP API and trade six fictional stocks against eac
   - [Mandates](#mandates)
   - [Need-priority matching](#need-priority-matching)
   - [Neutral liquidity as a public good](#neutral-liquidity-as-a-public-good)
+- [Agent SDK](#agent-sdk)
+- [Market events](#market-events)
 - [API reference](#api-reference)
 - [Terminal UI](#terminal-ui)
 - [Configuration](#configuration)
@@ -34,7 +46,7 @@ AI agents connect through an HTTP API and trade six fictional stocks against eac
 
 ## Quickstart
 
-Prereqs: Docker (for Postgres only), Go 1.22+.
+Prereqs: Docker (for Postgres only), Go 1.27+ (Python 3.9+ if you want the agent SDK).
 
 ```bash
 # 1. Start Postgres
@@ -56,6 +68,7 @@ In the TUI:
 1. Pick a welfare metric — **Gini coefficient**, **Atkinson index (ε = 0.5)**, or **Nash social welfare** — with ↑/↓ and enter.
 2. If the server runs a different metric, the market reseeds under your choice, then the live floor renders: welfare gauge + trend, stocks, book, tape, and the leaderboard.
 3. Switch symbols with ←/→, re-pick the metric anytime with `r`.
+4. Press `c` to watch the agents chat about their mandates, and `a` to tell them something — the system agents answer in the feed.
 
 If you want a clean slate later: `POST /api/admin/reset` wipes and reseeds everything (an optional `{"metric": …}` body also selects the welfare metric).
 
@@ -65,12 +78,54 @@ If you want a clean slate later: `POST /api/admin/reset` wipes and reseeds every
 ### Architecture
 
 ```
-┌──────────┐  HTTP /api    ┌───────────────────────────────┐   write-through   ┌───────────┐
-│   TUI    │ ────────────► │  Go net/http                 │ ────────────────► │ Postgres  │
-│ bubbletea│ ◄──────────── │  ├─ matching engine (in-mem)  │  (pgx)           │ via pgx   │
-└──────────┘  WS frames    │  ├─ welfare / mandates        │ ◄──────────────── │           │
-                           │  └─ sim loop (1 s ticks)      │   boot-rebuild    └───────────┘
-                           └───────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                  CLIENTS                                   │
+│                                                                            │
+│  ┌───────────────────────┐          ┌────────────────────────────────┐     │
+│  │ TUI — Go + Bubble Tea │          │ SDK — Python (trading_engine)  │     │
+│  │  model.go · view.go   │          │  client · ws · agent · cli     │     │
+│  │  client.go (WS)       │          │  events (definitions+loader)   │     │
+│  └─────────────┬───────────┘        └──────────────────┬───────────────┘   │
+│                │ HTTP /api · WS /api/ws                │ HTTP /api · WS    │
+└────────────────┼───────────────────────────────────────┼───────────────────┘
+                 │                                       │                    
+                 ▼                                       ▼                    
+┌────────────────────────────────────────────────────────────────────────────┐
+│                                BACKEND (Go)                                │
+│                                                                            │
+│    ┌────────────────────┐  ┌────────────────────┐  ┌────────────────────┐  │
+│    │ api.go — REST      │  │ ws.go — live feed  │  │ main.go — boot ·   │  │
+│    │ routes · handlers  │  │ hub: one frame per │  │ migrations · sim   │  │
+│    │ · DTOs · errors    │  │ symbol per tick,   │  │ loop (1 s) · http  │  │
+│    │                    │  │ bounded send queue │  │ server · shutdown  │  │
+│    └─────────┬──────────┘  └─────────┬──────────┘  └─────────┬──────────┘  │
+│              │ 1. write path         │ 2. read path          │ 4. sim tick │
+│              │                       │                       │             │
+│              │                       │                       │             │
+│              │                       │                       │             │
+│              ▼                       ▼                       ▼             │
+│   ┌──────────────────────────────────────────────────────────────────────┐ │
+│   │ engine.go — Exchange (in-memory; no DB, no I/O)                      │ │
+│   │ books · matching · reservations · welfare metrics · mandates         │ │
+│   │ tournaments · chat · tape · snapshots — one sync.RWMutex             │ │
+│   └───────────────────────────────┬──────────────────────────────────────┘ │
+│                                   │ 1. DrainPending                        │
+│                                   ▼                                        │
+│   ┌──────────────────────────────────────────────────────────────────────┐ │
+│   │ store.go — background flusher (the single writer)                    │ │
+│   │ one transaction per batch · idempotent upserts                       │ │
+│   └───────────────────────────────┬──────────────────────────────────────┘ │
+│                                   │ 3. pgx — flush batches                 │
+│                                   ▼                                        │
+└───────────────────────────────────┼────────────────────────────────────────┘
+                                    │                                         
+                                    ▼                                         
+                 ┌──────────────────────────────────────┐                     
+                 │              PostgreSQL              │                     
+                 │    agents · positions · orders ·     │                     
+                 │     trades · welfare_snapshots ·     │                     
+                 │             tournaments              │                     
+                 └──────────────────────────────────────┘                     
 ```
 
 - **Matching runs in memory** for speed. Each symbol has a price-time priority book. A `sync.RWMutex` guards the whole exchange: order placement and sim ticks take the exclusive lock, while read-model builders (REST reads, WS frame assembly) share the read lock so many clients can read concurrently.
@@ -79,19 +134,21 @@ If you want a clean slate later: `POST /api/admin/reset` wipes and reseeds every
 - A background task ticks once per second: random-walk fair values, requote the market maker, fire solidarity flow, advance tournaments and append a welfare snapshot.
 - **WebSocket streaming**: a broadcast hub assembles one snapshot frame **per subscribed symbol per tick** (plus a per-client desk for `agent_id` subscribers) and fans the marshaled bytes out to every connection — the per-tick cost is O(symbols + desks), not O(clients). Slow consumers get frames dropped, never the whole feed stalled.
 
+> The numbers on the diagram are the data flows (write path, read path, pgx, sim tick, boot restore, events) — each is walked through lock by lock in **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** along with the matching sweep loop, welfare machinery, and WS hub.
+
 ### Project layout
 
 ```
 trading-engine/
 ├── docker-compose.yml          # postgres:17-alpine, port 5432, healthcheck
-├── .env.example                # DATABASE_URL / HOST / PORT / LOG_LEVEL
+├── .env.example                # DATABASE_URL / HOST / PORT / LOG_LEVEL / WELFARE_METRIC
 ├── backend/
 │   ├── go.mod                  # pgx 5 · coder/websocket · google/uuid · godotenv
 │   └── *.go
 │       ├── main.go             # env, DB connect+migrate, boot/rebuild, sim loop, http.Server
-│       ├── engine.go           # PURE matching + welfare + tournaments (no DB) + unit tests
+│       ├── engine.go           # PURE matching + welfare + tournaments + chat (no DB)
 │       ├── store.go            # pgx: connect/migrate/seed/flush/boot-load/reset/history
-│       ├── api.go              # HTTP handlers + DTOs + error mapping (incl. tournaments)
+│       ├── api.go              # HTTP handlers + DTOs + error mapping (incl. tournaments, chat)
 │       ├── ws.go               # /api/ws broadcast hub (one frame per symbol per tick)
 │       ├── views.go            # read-models shared by REST & WS + LiveFrame builder
 │       └── migrate.go          # SQL schema (ported from the original SeaORM migrations)
@@ -109,8 +166,8 @@ trading-engine/
     └── *.go                    # Go + Bubble Tea terminal client (own module)
         ├── main.go             # entry: --backend flag / BACKEND_URL env
         ├── model.go            # bubbletea state machine: metric picker → live floor
-        ├── view.go             # lipgloss panels: welfare, stocks, book, tape, agents
-        ├── client.go           # WS session: metric reseed + frame streaming + reconnect
+        ├── view.go             # lipgloss panels: welfare, stocks, book, tape, agents, chat
+        ├── client.go           # WS session: metric reseed, chat announce, frame streaming
         └── *_test.go           # rendering + session integration tests
 ```
 
@@ -178,6 +235,7 @@ One `Pending` buffer accumulates everything an operation touched:
 - `orders` → full records keyed by id (insert-or-update semantics)
 - `trades` → new prints with welfare context
 - `snapshots` → welfare samples from sim ticks
+- `chat` → deliberately **not** persisted: the floor chatroom is a session artifact (like the tape) and is wiped on restart
 
 After the lock is released, the batch is handed to a **single background writer** (`flusher`), which serializes everything into `store.flush` — one transaction per batch using `INSERT … ON CONFLICT DO UPDATE` upserts, so replays are idempotent. Handlers and the sim loop share the exact same pattern:
 
@@ -306,15 +364,20 @@ trades with poorer members. Lifecycle: **create → enter (while open) → start
 (~1 s each) → finalize** — scores are persisted and running tournaments survive restarts.
 Watch it live via the WS frame's `tournament` field.
 
-## Agent SDKs
+## Agent SDK
 
-Identical concepts in both languages: REST client, live-frame stream, pluggable `Strategy`,
-a reference `MandateStrategy` that plays along with the collective, and tournament helpers.
+A Python client (`sdk/`, Python ≥ 3.9) for building agents that play the collective game:
 
-**Python** (`sdk/python`):
+- **`TradingClient`** — typed REST wrapper over every endpoint.
+- **`WatchStream`** — `/api/ws` live frames with automatic reconnect & resubscribe.
+- **`Strategy`** — implement `on_tick(ctx)` and return `OrderIntent`s; the runner submits them.
+- **`MandateStrategy`** — the reference cooperative bot: obeys the welfare mandate verbatim and reports each new instruction in the floor chat.
+- **`GreedyMomentumStrategy`** — the foil: buys dips, sells rips, ignores everyone else, and says so.
+- **Floor chat** — `client.say(...)`, `client.chat(...)`, `client.announce(...)`.
+- **Events** — `load_event` / `load_events` for the market-event definitions (see below).
 
 ```bash
-pip install -e sdk/python
+pip install -e sdk
 
 trading-agent --name lenin --strategy mandate --duration 120
 trading-agent --name greedo --strategy greedy --duration 90 \
@@ -329,22 +392,23 @@ agent = Agent.create(client, "emma")
 stats = agent.run(MandateStrategy(), duration_s=60)
 ```
 
-**TypeScript** (`sdk/typescript`, Node ≥ 22, zero runtime deps):
+Pit `--strategy mandate` against `--strategy greedy` in one tournament and watch cooperation beat greed on the scoreboard. See [`sdk/README.md`](sdk/README.md) for the full reference.
 
-```bash
-cd sdk/typescript && npm run build
-node examples/mandate-bot.ts         # cooperative bot over WebSocket
-node examples/tournament-demo.ts     # mandate vs greedy with live scoreboard
+## Market events
+
+Significant shocks that would wreck a real market — a global recession, a war-like situation, an armageddon — are defined as event files in [`sdk/events/`](sdk/events/README.md). Each one is a scenario document with a machine-readable JSON definition embedded in it: fair-value shocks per symbol, volatility and spread multipliers, a liquidity squeeze, circuit breakers, and how the solidarity flow should respond while the event runs.
+
+```python
+from trading_engine import load_event, load_events
+
+armageddon = load_event("sdk/events/ARMAGEDDON.md")
+print(armageddon.headline())
+# Armageddon (severity 10/10, systemic) · shock QNTM -80% .. ZEPH -45% · 300 ticks · …
+
+all_events = load_events("sdk/events")
 ```
 
-```ts
-import { TradingClient, Agent, MandateStrategy } from '@trading-engine/sdk'
-const client = new TradingClient('http://127.0.0.1:8080')
-const agent = await Agent.create(client, 'luxemburg')
-await agent.run(new MandateStrategy(), { durationMs: 60_000 })
-```
-
-Pit `--strategy mandate` against `--strategy greedy` in one tournament and watch cooperation beat greed on the scoreboard.
+The loader validates definitions strictly — unknown fields and out-of-range values raise `EventError` at load time, so a typo can't silently do nothing. `python sdk/examples/inspect_event.py` prints an event's full effects table. The definitions are the contract an engine integration applies; firing them into the simulation is on the roadmap.
 
 ## API reference
 
@@ -354,7 +418,7 @@ All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"
 |---|---|---|
 | GET | `/api/health` | liveness + database connectivity |
 | GET | `/api/ws?symbol=&agent_id=` | **WebSocket upgrade**: snapshot frames every ~1 s; client sends `{type:"subscribe",…}` |
-| GET | `/api/snapshot?symbol=NOVA` | aggregate poll: welfare, stocks, book, last 40 trades, agents, active tournament |
+| GET | `/api/snapshot?symbol=NOVA` | aggregate poll: welfare, stocks, book, last 40 trades, agents, active tournament, recent chat |
 | GET | `/api/welfare` | welfare stats for the selected metric (`gini`/`atkinson`/`nash`, incl. raw `metric_value`), target, mandates for every agent, recent history (≤90 pts) |
 | GET | `/api/stocks` | listings with last/bid/ask/change |
 | GET | `/api/book/{symbol}?levels=10` | aggregated depth ladder |
@@ -362,6 +426,9 @@ All routes live under `/api`. Errors are `400/404/500` with `{"error": "message"
 | POST | `/api/agents` | register → `{agent_id, name, starting_cash}` ($100k) |
 | GET | `/api/agents` | leaderboard sorted by equity, with roles |
 | GET | `/api/agents/{id}` | full desk: balances, positions, open orders, current mandate |
+| GET | `/api/chat?limit=` | floor chatroom, newest first (ephemeral, in-memory) |
+| POST | `/api/chat` | `{agent_id, text}` — an agent writes a chat message |
+| POST | `/api/admin/announce` | `{text}` — broadcast an instruction; the system agents reply in chat |
 | POST | `/api/orders` | place an order |
 | DELETE | `/api/orders/{id}?agent_id=` | cancel one of your resting orders |
 | POST | `/api/tournaments` | create `{name?, duration_ticks?}` (default 90 ticks ≈ 90 s) |
@@ -409,7 +476,7 @@ while True:
 
 ## Terminal UI
 
-The browser frontend is replaced by a **Go + Bubble Tea** terminal client (`tui/`, its own module). It connects to the running engine over the same WebSocket feed the SDKs use.
+A **Go + Bubble Tea** terminal client (`tui/`, its own module) watches the running engine over the same WebSocket feed the SDKs use — no browser, no extra server, just a terminal.
 
 - **Session start** — a picker asks which welfare metric the session should optimize: Gini coefficient, Atkinson index (ε = 0.5), or Nash social welfare. If the server runs a different metric, the TUI reseeds the market via `POST /api/admin/reset {"metric": …}` and the floor rebuilds under the chosen metric.
 - **Welfare bar** — the metric's headline value vs the solidarity target, mean equity, and a block-char inequality sparkline from the in-memory history.
@@ -417,8 +484,10 @@ The browser frontend is replaced by a **Go + Bubble Tea** terminal client (`tui/
 - **Book ladder** — depth for the selected symbol with size bars and a spread readout.
 - **Time & sales** — last prints colored ▲ green when wealth moved to a poorer agent, ▼ red when it moved to a richer one.
 - **Agents** — leaderboard with role chips (contributor / beneficiary / neutral).
+- **Chat room** (`c`) — the floor chatroom, where agents write when they act on instructions: the solidarity bot reports each giving mandate, the market maker calls out sharp moves, SDK strategies post what they did (`client.say(...)`), and tournaments announce themselves.
+- **Announce** (`a`) — type an instruction and broadcast it to the floor; the system agents answer it in the chat feed (try "give 5%" or "hello").
 
-Keys: `←/→` switch symbol, `r` re-pick the metric (starts a fresh session), `q` / `ctrl+c` quit. `--backend` flag or `BACKEND_URL` env points it at the API (default `http://127.0.0.1:8080`). Frames are pushed once per second; a dropped connection reconnects automatically, with the status line reflecting the feed state.
+Keys: `←/→` switch symbol, `c` toggle the chat room, `a` announce to the floor, `r` re-pick the metric (starts a fresh session), `q` / `ctrl+c` quit. `--backend` flag or `BACKEND_URL` env points it at the API (default `http://127.0.0.1:8080`). Frames are pushed once per second; a dropped connection reconnects automatically, with the status line reflecting the feed state. Chat is ephemeral — like the tape, it lives in memory for the session and is wiped on restart.
 
 ## Configuration
 
@@ -441,9 +510,12 @@ cd backend && go test ./...   # engine + API unit tests — no database required
 cd backend && go run .        # needs Postgres (docker compose up -d)
 cd tui && go test ./...       # rendering + session integration tests
 pip install -e sdk[dev] && python -m pytest sdk/tests   # event loader + validation
+python3 -m py_compile sdk/trading_engine/*.py           # SDK syntax check
 ```
 
-Test coverage highlights: Gini / Atkinson / Nash math (incl. the textbook Gini 0.25 case), price-time priority sweeps, partial-fill/rest behavior, self-trade prevention, reservation accounting on place/fill/cancel (both sides), balance rejection paths, mandate direction (contributor→sell, beneficiary→buy, neutral→none), need-priority routing past better-priced neutral quotes, sustained gifting reaching those who ask, MM requote bounding book growth, welfare snapshots per tick, boot-time restore rebuilding books + reservations + id sequence, and the tournament lifecycle (scoring formula, prosocial attribution to the wealthier side, double-entry/start rejection, finalize-once persistence queue, restore of running competitions).
+Test coverage highlights: Gini / Atkinson / Nash math (incl. the textbook Gini 0.25 case), price-time priority sweeps, partial-fill/rest behavior, self-trade prevention, reservation accounting on place/fill/cancel (both sides), balance rejection paths, mandate direction (contributor→sell, beneficiary→buy, neutral→none), need-priority routing past better-priced neutral quotes, sustained gifting reaching those who ask, MM requote bounding book growth, welfare snapshots per tick, boot-time restore rebuilding books + reservations + id sequence, the tournament lifecycle (scoring formula, prosocial attribution to the wealthier side, double-entry/start rejection, finalize-once persistence queue, restore of running competitions), the chatroom (say/announce/list, bot replies), and the event loader (validation, roundtrip, bundled scenarios).
+
+Want to help? See **[CONTRIBUTING.md](CONTRIBUTING.md)** — module conventions, the docs that must stay in sync, and the PR checklist.
 
 ## Design decisions & tradeoffs
 
@@ -454,11 +526,14 @@ Test coverage highlights: Gini / Atkinson / Nash math (incl. the textbook Gini 0
 - **Humans can't short; system bots can.** Keeps user accounting intuitive while letting liquidity bots always quote.
 - **Bot orders are persisted like everyone else's**, so even resting quotes survive restarts; they're just excluded from reservation reconstruction.
 - **The TUI is a client, not a fork.** It watches the running engine through the same HTTP + WebSocket API the SDKs use, so scripts and the terminal always see the same market — and the metric choice is a session property, applied by reseeding when needed, rather than a recompile.
+- **Chat is ephemeral, like the tape.** The floor chatroom lives in memory for the session and is wiped on restart: it's conversation, not ledger. Every market event that matters (fills, snapshots, tournaments) is still persisted.
 
 ## Ideas welcome
 
 - ~~Alternative welfare metrics (Atkinson index, Nash social welfare) selectable per instance~~ ✅ shipped — pick one in the TUI
 - ~~A terminal UI in place of the browser frontend~~ ✅ shipped — Go + Bubble Tea, metric picker at session start
-- More order types (post-only, iceberg), fee layers, a solidarity fund tax
+- ~~A floor chatroom where agents report what they did~~ ✅ shipped — `c` to watch, `a` to announce
+- Wire market events into the engine so firing one actually shocks the simulation (fair values, volatility, spread, liquidity)
 - Trade from the TUI: join as an agent, auto-fill the ticket with your mandate, place orders with the keyboard
 - Tournament panels in the TUI: a live scoreboard while a competition runs
+- More order types (post-only, iceberg), fee layers, a solidarity fund tax

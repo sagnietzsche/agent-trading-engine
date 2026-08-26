@@ -86,10 +86,22 @@ func viewLive(m *Model) string {
 	mid := lipgloss.JoinHorizontal(lipgloss.Top, stocks, "  ", book)
 
 	tape := panel("TIME & SALES", tapeLines(f.Tape), 52)
-	agents := panel("AGENTS", agentsLines(f.Agents), 46)
-	bottom := lipgloss.JoinHorizontal(lipgloss.Top, tape, "  ", agents)
+	right := panel("AGENTS", agentsLines(f.Agents), 46)
+	if m.showChat {
+		right = panel("CHAT ROOM", chatLines(f.Chat, 12), 46)
+	}
+	bottom := lipgloss.JoinHorizontal(lipgloss.Top, tape, "  ", right)
 
-	footer := styleDim.Render("[←/→] symbol    [r] change metric    [q] quit")
+	if m.announcing {
+		footer := lipgloss.JoinHorizontal(lipgloss.Top,
+			styleAcc.Render("📢 announce: "),
+			m.input+"▌",
+			styleDim.Render("    [enter] send · [esc] cancel"),
+		)
+		return lipgloss.JoinVertical(lipgloss.Left,
+			header, "", welfare, "", mid, "", bottom, "", footer)
+	}
+	footer := styleDim.Render("[←/→] symbol    [c] chat    [a] announce    [r] metric    [q] quit")
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header, "", welfare, "", mid, "", bottom, "", footer)
@@ -291,6 +303,51 @@ func agentsLines(agents []AgentView) string {
 		fmt.Fprintf(&sb, "%-20s %10s  %s\n", name, fmtMoney(a.Equity), roleStyle.Render(a.Role))
 	}
 	return sb.String()
+}
+
+// chatLines renders the floor chatroom, newest first. System chatter is dimmed
+// and italic, bot action reports keep their role color, and user agents' chat
+// lines are cyan.
+func chatLines(msgs []ChatMsg, n int) string {
+	if len(msgs) == 0 {
+		return styleDim.Render("silence… press [a] to announce something to the floor")
+	}
+	if n > len(msgs) {
+		n = len(msgs)
+	}
+	var sb strings.Builder
+	for _, msg := range msgs[:n] {
+		nameStyle := styleDim
+		switch msg.Kind {
+		case "mandate":
+			nameStyle = styleGood
+		case "market":
+			nameStyle = styleAcc
+		case "chat":
+			nameStyle = styleCyan
+		}
+		time := clockOf(msg.TS)
+		if time == msg.TS { // non-timestamp input; keep short
+			time = ""
+		}
+		name := msg.Name
+		if name == "" {
+			name = "floor"
+		}
+		text := truncate(msg.Text, 44)
+		fmt.Fprintf(&sb, "%s %s %s\n",
+			styleDim.Render(time), nameStyle.Render(name+":"), text)
+	}
+	return sb.String()
+}
+
+// truncate cuts a string to max runes, appending an ellipsis when cut.
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
 }
 
 // ---- formatting helpers ----------------------------------------------------

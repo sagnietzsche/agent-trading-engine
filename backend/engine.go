@@ -32,6 +32,7 @@ const (
 	StartingCash    = 100_000.0
 	TournamentRetW  = 1.0
 	TournamentCoopW = 1.0
+	ChatCap         = 200 // in-memory chat log (ephemeral, like the tape)
 )
 
 // WelfareMetric selects the collective-welfare statistic an exchange instance
@@ -336,6 +337,20 @@ type OrderRecord struct {
 	CreatedAt string    `json:"created_at"`
 }
 
+// ChatMessage is one line in the floor chatroom: system agents write when
+// they act on instructions (mandates, requotes, tournaments), any agent can
+// post via POST /api/chat, and the TUI monitors the stream. Ephemeral and
+// in-memory — like the tape, chat is a session artifact, not part of the
+// durable ledger.
+type ChatMessage struct {
+	ID     string    `json:"id"`
+	Author uuid.UUID `json:"author"`
+	Name   string    `json:"name"`
+	Kind   string    `json:"kind"` // system | mandate | market | chat
+	Text   string    `json:"text"`
+	TS     string    `json:"ts"`
+}
+
 type WelfareSnapshot struct {
 	Gini        float64       `json:"gini"`
 	Metric      WelfareMetric `json:"metric"`
@@ -636,6 +651,7 @@ type Exchange struct {
 	Agents         map[uuid.UUID]AgentCache
 	Trades         []Trade // newest first (front-pushed, capped)
 	Orders         map[uint64]OrderRecord
+	Chat           []ChatMessage // newest first (front-pushed, capped)
 	nextOrderID    uint64
 	rng            *rand.Rand
 	pending        Pending
@@ -784,7 +800,92 @@ func (ex *Exchange) RegisterAgent(name string, cash float64) uuid.UUID {
 	}
 	ex.pending.Agents[id] = cache
 	ex.Agents[id] = cache
+	ex.postChat(id, name, "system", "🎉 "+name+" joined the floor")
 	return id
+}
+
+// ---- chatroom ------------------------------------------------------------
+
+// postChat appends a message to the floor chat (newest first, capped). Callers
+// hold the engine lock; chat is ephemeral and never enters the Pending buffer.
+func (ex *Exchange) postChat(author uuid.UUID, name, kind, text string) {
+	msg := ChatMessage{
+		ID:     uuid.New().String(),
+		Author: author,
+		Name:   name,
+		Kind:   kind,
+		Text:   text,
+		TS:     time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	ex.Chat = append([]ChatMessage{msg}, ex.Chat...)
+	if len(ex.Chat) > ChatCap {
+		ex.Chat = ex.Chat[:ChatCap]
+	}
+}
+
+// Say lets any registered agent post a chat message (e.g. an SDK bot reporting
+// what it did after being instructed).
+func (ex *Exchange) Say(agentID uuid.UUID, text string) (*ChatMessage, error) {
+	a, ok := ex.Agents[agentID]
+	if !ok {
+		return nil, fmt.Errorf("unknown agent")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" || len(text) > 280 {
+		return nil, fmt.Errorf("message must be 1..280 characters")
+	}
+	ex.postChat(agentID, a.Name, "chat", text)
+	return &ex.Chat[0], nil
+}
+
+// Announce broadcasts an instruction to the floor (system message) and lets
+// the system agents answer it — the "tell the bots something, watch them
+// write" loop. Returns the messages just posted, newest first.
+func (ex *Exchange) Announce(text string) ([]ChatMessage, error) {
+	text = strings.TrimSpace(text)
+	if text == "" || len(text) > 280 {
+		return nil, fmt.Errorf("announcement must be 1..280 characters")
+	}
+	var posted []ChatMessage
+	ex.postChat(uuid.Nil, "floor", "system", "📢 "+text)
+	posted = append(posted, ex.Chat[0])
+	for _, reply := range ex.botReplies(text) {
+		ex.postChat(reply.agent, reply.name, "chat", reply.text)
+		posted = append(posted, ex.Chat[0])
+	}
+	return posted, nil
+}
+
+// botReplies is a tiny scripted instruction->reply table for the two system
+// agents. It keeps the chatroom alive: the user says something, the bots
+// answer with their role in mind.
+type botReply struct {
+	agent uuid.UUID
+	name  string
+	text  string
+}
+
+func (ex *Exchange) botReplies(text string) []botReply {
+	low := strings.ToLower(text)
+	var out []botReply
+	switch {
+	case strings.Contains(low, "give"), strings.Contains(low, "share"),
+		strings.Contains(low, "help"), strings.Contains(low, "redistribut"),
+		strings.Contains(low, "solidarity"):
+		out = append(out, botReply{SolidarityID, "solidarity_bot", "✊ On it — routing a gift to the worst-off members now."})
+	case strings.Contains(low, "volatil"), strings.Contains(low, "panic"),
+		strings.Contains(low, "crash"), strings.Contains(low, "spread"),
+		strings.Contains(low, "halt"):
+		out = append(out, botReply{MarketMakerID, "market_maker", "⚠ Widening the book and trimming size — protecting the spread."})
+	case strings.Contains(low, "hello"), strings.Contains(low, "hi"),
+		strings.Contains(low, "greeting"), strings.Contains(low, "hey"):
+		out = append(out, botReply{SolidarityID, "solidarity_bot", "Greetings, comrade. I hold surplus to distribute whenever inequality calls."})
+	case strings.Contains(low, "tournament"), strings.Contains(low, "compete"), strings.Contains(low, "winner"):
+		out = append(out, botReply{MarketMakerID, "market_maker", "I don't compete — I quote both sides of every book. Good luck to the entrants."})
+	default:
+		out = append(out, botReply{MarketMakerID, "market_maker", "Noted. Staying two-sided — call me if you need liquidity."})
+	}
+	return out
 }
 
 func (ex *Exchange) UpsertAgentCache(cache AgentCache) {
@@ -1069,6 +1170,8 @@ func (ex *Exchange) StartTournament(tournamentID uuid.UUID) error {
 			t.Entries[id] = e
 		}
 	}
+	ex.postChat(uuid.Nil, "floor", "system",
+		fmt.Sprintf("🏁 Tournament '%s' started — %d entrant(s) locked in", t.Name, len(t.Entries)))
 	return nil
 }
 
@@ -1684,7 +1787,9 @@ func (ex *Exchange) SeedSystemAgents() {
 
 func (ex *Exchange) SimTick() {
 	// 1. Random walk fair values.
+	prevFair := make([]float64, len(ex.Symbols))
 	for i := range ex.Symbols {
+		prevFair[i] = ex.Symbols[i].Info.Fair
 		g := ex.rng.Float64()*2 - 1 // uniform in [-1, 1)
 		shock := g * g * g * 3.0
 		drift := -0.0015 + ex.rng.Float64()*0.0035 // uniform in [-0.0015, 0.002)
@@ -1714,6 +1819,29 @@ func (ex *Exchange) SimTick() {
 
 	ex.CancelAllForAgent(SolidarityID)
 
+	// The market maker comments when a tick moves the market meaningfully.
+	{
+		var worstSym string
+		worstPct := 0.0
+		for i := range ex.Symbols {
+			if prevFair[i] <= 0.0 {
+				continue
+			}
+			pct := math.Abs(ex.Symbols[i].Info.Fair/prevFair[i] - 1.0)
+			if pct > worstPct {
+				worstPct, worstSym = pct, ex.Symbols[i].Info.Symbol
+			}
+		}
+		if worstPct > 0.015 {
+			sign := "rose"
+			if ex.Symbols[ex.bySymbol[worstSym]].Info.Fair < prevFair[ex.bySymbol[worstSym]] {
+				sign = "fell"
+			}
+			ex.postChat(MarketMakerID, "market_maker", "market",
+				fmt.Sprintf("⚠ %s %s %+.2f%% this tick — widening the book", worstSym, sign, worstPct*100))
+		}
+	}
+
 	// 3. Cooperative redistribution: while inequality sits above target, the
 	//    solidarity bot executes its own giving mandate as a solidarity order.
 	w := ex.Welfare()
@@ -1724,7 +1852,7 @@ func (ex *Exchange) SimTick() {
 				if qty > 500 {
 					qty = 500
 				}
-				ex.PlaceSolidarityOrder(
+				_, fills, perr := ex.PlaceSolidarityOrder(
 					SolidarityID,
 					m.Suggestion.Symbol,
 					m.Suggestion.Side,
@@ -1732,6 +1860,14 @@ func (ex *Exchange) SimTick() {
 					qty,
 					&m.Suggestion.Limit,
 				)
+				if perr == nil && len(fills) > 0 {
+					sold := 0
+					for _, f := range fills {
+						sold += int(f.Qty)
+					}
+					ex.postChat(SolidarityID, "solidarity_bot", "mandate",
+						fmt.Sprintf("✊ Giving %d %s to the bids of the worst-off — %d shares, mandate fulfilled.", sold, m.Suggestion.Symbol, sold))
+				}
 				break
 			}
 		}
@@ -1767,6 +1903,8 @@ func (ex *Exchange) SimTick() {
 			if v := ex.TournamentView(id); v != nil {
 				logTournamentResult(v)
 				ex.pending.TournamentsFinalized = append(ex.pending.TournamentsFinalized, *v)
+				ex.postChat(uuid.Nil, "floor", "system",
+					fmt.Sprintf("🏁 Tournament '%s' finished", v.Name))
 			}
 		}
 	}

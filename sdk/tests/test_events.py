@@ -103,6 +103,13 @@ def test_bad_float_type_rejected():
         Event.from_dict(raw)
 
 
+def test_zero_liquidity_size_rejected():
+    raw = valid_raw()
+    raw["liquidity"] = {"levels": 1, "size_multiplier": 0}
+    with pytest.raises(EventError, match="size_multiplier"):
+        Event.from_dict(raw)
+
+
 def test_missing_file_raises():
     with pytest.raises(EventError, match="not found"):
         load_event(EVENTS / "DOES_NOT_EXIST.md")

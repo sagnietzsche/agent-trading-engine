@@ -62,6 +62,7 @@ func TestSessionResetsMetricThenStreamsFrames(t *testing.T) {
 	defer srv.Close()
 
 	sub := make(chan string, 4)
+	announce := make(chan string, 4)
 	var framesMu sync.Mutex
 	frames := 0
 	gotResetStatus := false
@@ -81,7 +82,7 @@ func TestSessionResetsMetricThenStreamsFrames(t *testing.T) {
 				gotResetStatus = true
 			}
 		}
-	}, sub)
+	}, sub, announce)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
