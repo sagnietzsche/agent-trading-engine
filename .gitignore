@@ -6,3 +6,6 @@ backend/target/
 backend/backend
 *.log
 .DS_Store
+.venv/
+__pycache__/
+*.pyc

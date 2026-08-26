@@ -32,3 +32,21 @@ agent.run(MandateStrategy(), duration_s=60)
 
 Strategies receive a `Context` with `.snapshot`, `.welfare`, `.mandate`, `.desk` and a bound
 `.submit(OrderIntent(...))`. Return intents from `on_tick`, or call `ctx.submit` directly.
+
+## Market events
+
+Significant shocks — a global recession, a war-like situation, an armageddon — are defined as
+event files in `sdk/events/` (scenario docs with a machine-readable JSON definition embedded in
+each). Load and validate them with the SDK:
+
+```python
+from trading_engine import load_event, load_events
+
+recession = load_event("sdk/events/GLOBAL_RECESSION.md")
+all_events = load_events("sdk/events")
+print(recession.headline())
+```
+
+`load_event` accepts `.md` scenario docs or bare `.json` files and enforces the event schema
+strictly — a typo in a field name raises `EventError` at load time. See `sdk/events/README.md`
+for the full format reference, and `python sdk/examples/inspect_event.py` for a quick demo.

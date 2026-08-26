@@ -9,12 +9,17 @@ from .agent import (
     Strategy,
 )
 from .client import TradingClient, TradingError
+from .events import Event, EventError, load_event, load_events
 from .ws import WatchStream
 
 __all__ = [
     "Agent",
     "Context",
+    "Event",
+    "EventError",
     "GreedyMomentumStrategy",
+    "load_event",
+    "load_events",
     "MandateStrategy",
     "OrderIntent",
     "Strategy",

@@ -96,12 +96,15 @@ trading-engine/
 │       ├── views.go            # read-models shared by REST & WS + LiveFrame builder
 │       └── migrate.go          # SQL schema (ported from the original SeaORM migrations)
 ├── sdk/
-│   ├── python/                 # pip install -e sdk/python · trading-agent CLI
-│   │   ├── trading_engine/{client,ws,agent,cli}.py
-│   │   └── examples/
-│   └── typescript/             # npm run build (Node >=22, zero runtime deps)
-│       ├── src/{client,ws,strategies,agent}.ts
-│       └── examples/{mandate-bot,tournament-demo}.ts
+│   ├── pyproject.toml          # pip install -e sdk · trading-agent CLI
+│   ├── trading_engine/         # python client: {client,ws,agent,cli,events}.py
+│   ├── events/                 # market event definitions (scenario + JSON)
+│   │   ├── README.md           # event format reference
+│   │   ├── GLOBAL_RECESSION.md # severity 6/10 — credit freeze + demand collapse
+│   │   ├── WAR_LIKE_SITUATION.md # severity 8/10 — energy spike, supply chains crushed
+│   │   └── ARMAGEDDON.md       # severity 10/10 — total loss of confidence
+│   ├── examples/               # mandate-bot, greedy-vs-cooperative, inspect-event
+│   └── tests/                  # pytest: event loader + validation
 └── tui/
     └── *.go                    # Go + Bubble Tea terminal client (own module)
         ├── main.go             # entry: --backend flag / BACKEND_URL env
@@ -437,6 +440,7 @@ Engine tuning constants (recompile to change): `GINI_TARGET`, `ROLE_THRESHOLD`, 
 cd backend && go test ./...   # engine + API unit tests — no database required
 cd backend && go run .        # needs Postgres (docker compose up -d)
 cd tui && go test ./...       # rendering + session integration tests
+pip install -e sdk[dev] && python -m pytest sdk/tests   # event loader + validation
 ```
 
 Test coverage highlights: Gini / Atkinson / Nash math (incl. the textbook Gini 0.25 case), price-time priority sweeps, partial-fill/rest behavior, self-trade prevention, reservation accounting on place/fill/cancel (both sides), balance rejection paths, mandate direction (contributor→sell, beneficiary→buy, neutral→none), need-priority routing past better-priced neutral quotes, sustained gifting reaching those who ask, MM requote bounding book growth, welfare snapshots per tick, boot-time restore rebuilding books + reservations + id sequence, and the tournament lifecycle (scoring formula, prosocial attribution to the wealthier side, double-entry/start rejection, finalize-once persistence queue, restore of running competitions).
