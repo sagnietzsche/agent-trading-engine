@@ -13,9 +13,9 @@ tick. File references are relative to `backend/`.
 │                                  CLIENTS                                   │
 │                                                                            │
 │  ┌───────────────────────┐          ┌────────────────────────────────┐     │
-│  │ TUI — Go + Bubble Tea │          │ SDK — Python (trading_engine)  │     │
-│  │  model.go · view.go   │          │  client · ws · agent · cli     │     │
-│  │  client.go (WS)       │          │  events (definitions+loader)   │     │
+│  │ TUI — Go + Bubble Tea │          │ DESK — Python (trading_engine) │     │
+│  │  model.go · view.go   │          │  analyst → strategist → PM →   │     │
+│  │  client.go (WS)       │          │  risk → execution  (§9, Claude)│     │
 │  └─────────────┬───────────┘        └──────────────────┬───────────────┘   │
 │                │ HTTP /api · WS /api/ws                │ HTTP /api · WS    │
 └────────────────┼───────────────────────────────────────┼───────────────────┘
@@ -37,7 +37,7 @@ tick. File references are relative to `backend/`.
 │              ▼                       ▼                       ▼             │
 │   ┌──────────────────────────────────────────────────────────────────────┐ │
 │   │ engine.go — Exchange (in-memory; no DB, no I/O)                      │ │
-│   │ books · matching · reservations · welfare metrics · mandates         │ │
+│   │ books · matching · reservations · welfare metrics · regimes (§4)     │ │
 │   │ tournaments · chat · tape · snapshots — one sync.RWMutex             │ │
 │   └───────────────────────────────┬──────────────────────────────────────┘ │
 │                                   │ 1. DrainPending                        │
@@ -69,6 +69,9 @@ tick. File references are relative to `backend/`.
   enough to build a read-model, then marshal/stream outside the lock.
 - **Postgres is the durable ledger**; the in-memory exchange is the hot path.
   On boot, the exchange is rebuilt from Postgres (`bootExchange` → `Restore`).
+- **The backend has no trading view.** Under the default neutral regime it is a
+  fair, fast venue and nothing more — see §4. Every decision belongs to a client
+  like the agent desk in §9, which gets no privileged access.
 
 ### Data flows (the numbers on the diagram)
 
@@ -188,18 +191,56 @@ A market order has no limit: it sweeps whatever crosses and **cancels the
 unfilled remainder**. If there is no opposite-side liquidity at all, it is
 rejected with `no liquidity on the opposite side of the book`.
 
-### Solidarity routing
+### Solidarity routing (solidarity regime only)
 
-`place_solidarity_order` marks the taker order as solidarity. Before matching,
-the engine computes the set of **beneficiaries** — agents whose equity sits
-more than `ROLE_THRESHOLD` below the mean. During the sweep, candidate
-counterparties in that set are matched **first, regardless of price**; only
-when nobody needs help does normal price-time priority resume. This is how a
-gift can't be intercepted by the market maker or a better-priced neutral quote.
+`PlaceSolidarityOrder` marks the taker order as solidarity. Under
+`RegimeSolidarity`, the engine computes the set of **beneficiaries** before
+matching — agents whose equity sits more than `ROLE_THRESHOLD` below the mean.
+During the sweep, candidate counterparties in that set are matched **first,
+regardless of price**; only when nobody needs help does normal price-time
+priority resume. This is how a gift can't be intercepted by the market maker or
+a better-priced neutral quote.
+
+Under the default `RegimeNeutral` the flag is **inert**: `execute()` gates the
+beneficiary computation on `ex.solidarityEnabled()`, so a solidarity-marked
+order gets exactly the same price-time priority as everything else. That is
+asserted directly in `TestNeutralRegimeIssuesNoMandatesAndNoNeedPriority`.
 
 ---
 
-## 4. The welfare machinery
+## 4. Market regimes and the welfare machinery
+
+### The regime switch
+
+`MarketRegime` is instance-level configuration (`MARKET_REGIME` env, or the
+`{"regime": …}` body of `POST /api/admin/reset`), resolved once into
+`Exchange.regime` and read everywhere through one predicate:
+
+```go
+func (ex *Exchange) solidarityEnabled() bool {
+    return ex.regime.normalized() == RegimeSolidarity
+}
+```
+
+Everything that expresses a house view hangs off it:
+
+| Behaviour | `neutral` (default) | `solidarity` |
+|---|---|---|
+| `Mandates()` | returns `nil` | one mandate per agent |
+| `execute()` need-priority | skipped | beneficiaries matched first |
+| `tournamentScore()` | `return` only | `return + coop_share` |
+| Second system agent (`SolidarityID`) | `quoteDepthTick()` — rests passive size 5–9 ticks out, never crosses | `redistributeTick()` — executes its own giving mandate |
+| Its display name | `depth_bot` | `solidarity_bot` |
+| `Welfare()` | still computed and published, purely observational | drives the mandate machinery |
+
+Welfare metrics are computed under **both** regimes. A neutral venue still
+reports how concentrated wealth is; it just does nothing about it. `Welfare`
+carries a `regime` field so a client can tell whether the mandate machinery
+behind those numbers is live.
+
+The default is neutral because "agents make every decision" and "the venue
+nudges everyone toward equal shares" are separate experiments — mixing them
+makes the first one unreadable.
 
 ### Metrics
 
@@ -218,9 +259,10 @@ Wherever you see `Gini` in a JSON field name (`gini`, `gini_after`,
 `gini_target`) it holds *this* index for the selected metric — the names are
 legacy for API stability.
 
-### Mandates
+### Mandates (solidarity regime only)
 
-`Mandates()` marks every agent relative to the mean:
+`Mandates()` returns `nil` outside the solidarity regime. Under it, it marks
+every agent relative to the mean:
 
 - **Contributor** (> +10%) → *give*: sell inventory from the largest holding,
   priced at the current **bid** so it crosses immediately (the concession).
@@ -235,14 +277,25 @@ SimTick() — engine lock held
      + fat-tailed shock (cubed uniform noise), clamped
   2. Requote the market maker: cancel all its quotes, post 3 bid +
      3 ask levels around fair with spread max(fair×0.0015, $0.01)
-     and random sizes 20–89 (cancel-then-repost keeps books bounded)
-  3. Solidarity flow: if inequality > GiniTarget, the solidarity bot
-     executes its giving mandate as a solidarity order (need-priority)
+     and random sizes 20–89 (cancel-then-repost keeps books bounded).
+     Cancel the second system agent's quotes too.
+  3. The second system agent, per regime:
+       neutral    → quoteDepthTick(): rest 3 levels a side at 5/7/9x the
+                    MM spread, size 200–499. Never crosses; adds depth for
+                    agents to trade against without steering price.
+       solidarity → redistributeTick(): if inequality > GiniTarget,
+                    execute its giving mandate as a solidarity order
   4. Advance tournaments: countdown ticks → finalize + queue scores
   5. Snapshot welfare (metric, metric_value, mean, total) → pending
   + chat: the market maker calls out sharp ticks (>1.5%), the solidarity
     bot reports each gift it lands, tournaments announce start/finish
 ```
+
+Note what is *not* in this list: nothing in the backend takes liquidity on a
+view. Both system agents post and cancel; neither crosses the spread to express
+an opinion (the solidarity bot's giving order crosses, but it is executing a
+published mandate, not trading a signal). Every aggressive order on a neutral
+venue came from an agent that decided to send it.
 
 ---
 
@@ -362,5 +415,68 @@ straightforward:
 | `volatility` | SimTick step 1 — random-walk shock multiplier |
 | `spread_multiplier` / `liquidity` | SimTick step 2 — MM requote parameters |
 | `circuit_breaker` | new: suspend matching for `halt_ticks` after a `drop_pct` move |
-| `solidarity.*` | SimTick step 3 — `GiniTarget` / `GiftRate` multipliers |
+| `solidarity.*` | SimTick step 3 — `GiniTarget` / `GiftRate` multipliers (solidarity regime) |
 | `news` | broadcast as `system` chat messages (§7) |
+
+They are, however, already consumed on the **client** side: `trading-desk
+--events sdk/events` renders the loaded definitions into the event
+strategist's briefing (shock table, headlines, stated mechanism), and that seat
+has to work out how much of each shock the tape has already priced in. The
+definitions are live input to a decision today, even though the simulation does
+not yet fire them.
+
+---
+
+## 9. The agent desk (Python)
+
+The desk lives entirely in `../sdk/trading_engine/` and talks to the backend
+through the same public HTTP API as anything else — it gets no privileged
+access, and the exchange has no idea an LLM is on the other end.
+
+```
+snapshot + agent detail ──► brief.py ──► market brief + desk brief
+                                              │
+                              ┌───────────────┴───────────────┐
+                              ▼   (concurrent, ThreadPool)    ▼
+                     agents/analyst.py                agents/strategist.py
+                        MarketRead                        MacroRead
+                              └───────────────┬───────────────┘
+                                              ▼
+                                       agents/pm.py  ◄── journal.py recall
+                                       PortfolioPlan
+                                              ▼
+                                      agents/risk.py          judgement
+                                      RiskAssessment
+                                              ▼
+                                      risk.py enforce()       arithmetic
+                                      ApprovedTicket[]
+                                              ▼
+                                     agents/trader.py ──► POST /api/orders
+                                     tool-calling loop
+                                              ▼
+                                       journal.py (JSONL)
+```
+
+Three structural choices carry most of the weight:
+
+1. **Typed seams.** Every hand-off is a pydantic model passed as a
+   structured-output format, so a drifting agent fails at the boundary rather
+   than three steps later. It is also what makes the whole pipeline testable
+   with a stub LLM and no network.
+2. **Authorization in tools, not prompts.** `agents/trader.py` builds its tools
+   per cycle, closed over an authorization session holding the approved
+   tickets. A call for an unapproved symbol, a flipped side, or an excess
+   quantity returns an error *string* — the model reads it and corrects, and
+   nothing reaches the exchange.
+3. **Two-layer risk with a fixed order.** The LLM risk officer catches what no
+   static rule would (a ticket citing a signal the analyst never produced);
+   `risk.enforce()` catches the risk officer. Arithmetic runs last and can only
+   reduce.
+
+**Prompt caching** is a design constraint, not an optimisation. Every agent's
+system prompt is `[venue_manual (cache breakpoint), role charter]`, and the
+manual is byte-identical across all five seats and every cycle, so they share
+one cached prefix. `brief.py` therefore contains no wall clock — frames are
+identified by sequence number — and there is a test asserting it. The `Ledger`
+reports the realised `cache_read_input_tokens` share at the end of every run,
+because caching you don't measure is caching you don't have.

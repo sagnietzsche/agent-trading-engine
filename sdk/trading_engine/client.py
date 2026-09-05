@@ -31,6 +31,7 @@ class TradingClient:
     # -- market data ----------------------------------------------------------
 
     def health(self) -> dict:
+        """Liveness plus the venue's instance config: regime and welfare metric."""
         return self._req("GET", "/api/health")
 
     def snapshot(self, symbol: str = "NOVA") -> dict:
@@ -120,6 +121,17 @@ class TradingClient:
     def start_tournament(self, tournament_id: str) -> dict:
         return self._req("POST", f"/api/tournaments/{tournament_id}/start")
 
-    def reset_market(self) -> dict:
-        """Wipe and reseed everything. Admin action."""
-        return self._req("POST", "/api/admin/reset")
+    def reset_market(self, metric: str | None = None, regime: str | None = None) -> dict:
+        """Wipe and reseed everything. Admin action.
+
+        ``regime`` switches the venue between ``neutral`` (a conventional
+        exchange, the default) and ``solidarity`` (mandates and need-priority
+        matching). ``metric`` selects the welfare statistic: gini, atkinson,
+        or nash. Omitted fields keep whatever the instance is running.
+        """
+        body: dict[str, Any] = {}
+        if metric is not None:
+            body["metric"] = metric
+        if regime is not None:
+            body["regime"] = regime
+        return self._req("POST", "/api/admin/reset", json=body or None)

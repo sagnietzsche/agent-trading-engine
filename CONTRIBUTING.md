@@ -10,13 +10,13 @@ before you start, and keep it updated when the conventions change.
 |---|---|---|
 | `backend/` | Go server: matching engine, REST API, WebSocket hub, Postgres persistence | `trading-engine/backend` |
 | `tui/` | Go + Bubble Tea terminal client (own module, talks to the backend) | `trading-engine/tui` |
-| `sdk/` | Python agent SDK (`trading_engine` package), market-event definitions, examples, tests | `trading_engine` |
+| `sdk/` | Python agent desk (`trading_engine` package): the five LLM seats, risk limits, journal, REST/WS client, market-event definitions, examples, tests | `trading_engine` |
 | `docs/` | Deep-dive architecture notes | — |
 
 ## Prerequisites
 
 - **Go 1.27+** — for both `backend/` and `tui/` (each module pins its own version).
-- **Python 3.9+** — for `sdk/` work.
+- **Python 3.10+** — for `sdk/` work. Running the desk against a live model also needs Anthropic credentials (`ant auth login` or `ANTHROPIC_API_KEY`); the test suite does not.
 - **Postgres** — `docker compose up -d` (or any Postgres; set `DATABASE_URL`).
 - The engine does not require a database for its unit tests — only for running the server.
 
@@ -47,7 +47,7 @@ cd tui && go build ./... && go vet ./... && go test ./...
 python -m venv sdk/.venv                       # once
 sdk/.venv/bin/pip install -e "sdk[dev]"        # once
 sdk/.venv/bin/python -m pytest sdk/tests -q
-sdk/.venv/bin/python -m py_compile sdk/trading_engine/*.py sdk/examples/*.py
+sdk/.venv/bin/python -m py_compile sdk/trading_engine/*.py sdk/trading_engine/agents/*.py sdk/examples/*.py
 ```
 
 A change is not done until all three suites pass.
@@ -82,6 +82,12 @@ A change is not done until all three suites pass.
   `inequality()` returns an index in `[0, 1]` (that is what `Welfare.Gini`, the
   tape's `gini_after`, and the sim's solidarity trigger all consume). Update
   the docs.
+- **Anything welfare-flavoured is regime-gated.** Mandates, need-priority
+  matching, the cooperation term in tournament scores, and the redistribution
+  bot all hang off `ex.solidarityEnabled()`. A neutral exchange must issue no
+  instructions and give no order a matching privilege — if you add a feature
+  that steers outcomes, gate it the same way and test both regimes
+  (`testExchange()` is neutral, `solidarityExchange()` is not).
 - **Tests.** New engine behavior → `engine_test.go`; new endpoints → `api_test.go`
   (these use `httptest` and an in-memory exchange — no database).
 
@@ -105,11 +111,27 @@ A change is not done until all three suites pass.
 - 4-space indent, double-quoted strings, `from __future__ import annotations`.
 - Keep `events.py` dependency-free (stdlib only): the event tests must run with
   only `pytest` installed.
-- `TradingClient` is the REST surface; `WatchStream` is the WebSocket surface;
-  strategies implement `on_tick(ctx)` and return `OrderIntent`s (or call
-  `ctx.submit`). Public names are exported from `trading_engine/__init__.py`.
-- Chat is best-effort from strategies: wrap `client.say(...)` in a try/except so
-  a chat failure can never break trading.
+- `TradingClient` is the REST surface; `WatchStream` is the WebSocket surface.
+  Public names are exported from `trading_engine/__init__.py`.
+- **Every hand-off between agents is a schema.** Adding or changing what one
+  seat tells another means editing `schemas.py` first — never pass prose or a
+  bare dict across a seam.
+- **Adding or changing a seat**: subclass `DeskAgent`, give it a `role`, an
+  `effort`, and a `charter`. Charters are prompts and belong in the agent file,
+  not in `desk.py`. Keep them about the *job* — venue rules that every seat
+  needs go in `brief.venue_manual()`.
+- **`venue_manual()` is the cached prompt prefix**, byte-identical across every
+  seat and every cycle. Nothing time-varying may go in it — there is a test
+  asserting exactly that, and breaking it silently multiplies the token bill.
+- **Only `agents/trader.py` gets tools.** Any new exchange-touching tool must
+  validate its arguments against the approved tickets before calling the
+  client, and return an error string rather than raising — the model reads the
+  refusal and corrects.
+- **`risk.enforce()` may only ever reduce a ticket**, and it runs after the risk
+  officer. If you add a limit, add it there (not in a prompt) and test it in
+  isolation in `tests/test_risk.py`.
+- Tests must run without credentials: stub the model, never call it. See
+  `StubLLM` in `tests/test_desk.py`.
 - Adding a market event: write `sdk/events/<SLUG>.md` with a narrative and an
   embedded ```json definition (see `sdk/events/README.md`), then validate with
   `python sdk/examples/inspect_event.py sdk/events/<SLUG>.md`.
@@ -121,12 +143,12 @@ Behavior changes should update the relevant docs in the same commit:
 - `README.md` — quickstart, API table, feature descriptions.
 - `docs/ARCHITECTURE.md` — the deep-dive (sequence diagrams, lock/flush model).
 - `sdk/events/README.md` — the event format reference.
-- `sdk/README.md` — SDK usage.
+- `sdk/README.md` — desk and SDK usage.
 
 ## Commit conventions
 
 - One logical change per commit; a concise imperative summary line that says
-  *why* (`Add need-priority routing for solidarity orders`, not `update code`).
+  *why* (`Gate need-priority routing behind the solidarity regime`, not `update code`).
 - Keep the working tree free of build artifacts (`tui/tui`, `__pycache__/`,
   `.venv/` are gitignored).
 - Include the verification in the PR description: which suites were run.

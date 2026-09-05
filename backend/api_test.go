@@ -15,9 +15,10 @@ import (
 )
 
 // newTestServer builds a server with a fresh exchange and no database (only
-// used for endpoints that don't touch Postgres).
+// used for endpoints that don't touch Postgres). The regime is explicit so the
+// suite behaves the same however MARKET_REGIME happens to be set.
 func newTestServer() *httptest.Server {
-	ex := FreshSimulated()
+	ex := exchangeFor(RegimeNeutral)
 	srv := &server{
 		ctx: context.Background(),
 		ex:  &lockedExchange{ex: ex},
@@ -54,6 +55,26 @@ func getObj(t *testing.T, ts *httptest.Server, path string, wantStatus int) map[
 		t.Fatalf("GET %s: expected object, got %T", path, v)
 	}
 	return obj
+}
+
+// /api/health is how a client learns which microstructure it is trading on,
+// so the field has to be there and has to be right.
+func TestHealthAdvertisesTheInstanceConfig(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+
+	h := getObj(t, ts, "/api/health", 200)
+	for _, k := range []string{"status", "database", "regime", "metric"} {
+		if _, ok := h[k]; !ok {
+			t.Fatalf("health missing key %q: %v", k, h)
+		}
+	}
+	if h["regime"] != string(RegimeNeutral) {
+		t.Fatalf("default regime = %v, want %s", h["regime"], RegimeNeutral)
+	}
+	if h["metric"] != string(MetricGini) {
+		t.Fatalf("default metric = %v, want %s", h["metric"], MetricGini)
+	}
 }
 
 func TestReadEndpointsJSONContract(t *testing.T) {
@@ -121,7 +142,7 @@ func TestReadEndpointsJSONContract(t *testing.T) {
 	}
 
 	w := snap["welfare"].(map[string]any)
-	for _, k := range []string{"gini", "metric", "metric_value", "total_equity", "mean_equity", "gini_target"} {
+	for _, k := range []string{"gini", "metric", "metric_value", "total_equity", "mean_equity", "gini_target", "regime"} {
 		if _, ok := w[k]; !ok {
 			t.Fatalf("welfare missing key %q", k)
 		}
@@ -212,7 +233,7 @@ func TestChatSayAndAnnounce(t *testing.T) {
 	}
 	var sawBotReply bool
 	for _, m := range posted {
-		if m["name"] == "solidarity_bot" || m["name"] == "market_maker" {
+		if m["name"] == "depth_bot" || m["name"] == "solidarity_bot" || m["name"] == "market_maker" {
 			sawBotReply = true
 		}
 	}

@@ -49,8 +49,10 @@ func (s *server) submitFlush(pending *Pending) {
 // ---- DTOs -----------------------------------------------------------------
 
 type healthResp struct {
-	Status   string `json:"status"`
-	Database string `json:"database"`
+	Status   string        `json:"status"`
+	Database string        `json:"database"`
+	Regime   MarketRegime  `json:"regime"`
+	Metric   WelfareMetric `json:"metric"`
 }
 
 type snapshotResp struct {
@@ -108,11 +110,14 @@ type createTournamentReq struct {
 	DurationTicks *uint32 `json:"duration_ticks"`
 }
 
-// resetReq is an optional body for POST /api/admin/reset: when a metric is
-// supplied the market is reseeded with that welfare metric selected (this is
-// how the TUI starts a session with the user's pick).
+// resetReq is an optional body for POST /api/admin/reset. A supplied metric
+// reseeds with that welfare statistic selected (this is how the TUI starts a
+// session with the user's pick); a supplied regime switches the exchange
+// between the neutral default and the solidarity microstructure. Omitted
+// fields keep whatever the instance is already running.
 type resetReq struct {
 	Metric *string `json:"metric"`
+	Regime *string `json:"regime"`
 }
 
 type enterTournamentReq struct {
@@ -201,11 +206,18 @@ func parseKind(s string) (OrderKind, bool) {
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), healthTimeout)
 	defer cancel()
-	status := "connected"
-	if err := s.db.Ping(ctx); err != nil {
-		status = "unavailable"
+	status := "unavailable"
+	if s.db != nil {
+		if err := s.db.Ping(ctx); err == nil {
+			status = "connected"
+		}
 	}
-	writeJSON(w, http.StatusOK, healthResp{Status: "ok", Database: status})
+	ex := s.ex.rlock()
+	regime, metric := ex.Regime(), ex.metric.normalized()
+	s.ex.runlock()
+	writeJSON(w, http.StatusOK, healthResp{
+		Status: "ok", Database: status, Regime: regime, Metric: metric,
+	})
 }
 
 func (s *server) handleStocks(w http.ResponseWriter, r *http.Request) {
@@ -484,8 +496,9 @@ func (s *server) handleAnnounce(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
-	// Optional body: {"metric": "gini"|"atkinson"|"nash"}. An empty body
-	// keeps the current metric and just reseeds.
+	// Optional body: {"metric": "gini"|"atkinson"|"nash",
+	// "regime": "neutral"|"solidarity"}. An empty body keeps the current
+	// configuration and just reseeds.
 	var req resetReq
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -514,9 +527,20 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 	if req.Metric != nil {
 		ex.metric = parseWelfareMetric(*req.Metric)
 	}
+	if req.Regime != nil {
+		ex.regime = parseMarketRegime(*req.Regime)
+		// The second system agent changes job with the regime, and it was
+		// seeded under the previous one.
+		if a, ok := ex.Agents[SolidarityID]; ok {
+			a.Name = liquidityBotName(ex.regime)
+			ex.Agents[SolidarityID] = a
+			ex.touchAgent(SolidarityID)
+		}
+	}
 	metric := string(ex.metric)
+	regime := string(ex.Regime())
 	ex.postChat(uuid.Nil, "floor", "system",
-		fmt.Sprintf("🔁 Market reseeded — session now runs on the %s metric", metric))
+		fmt.Sprintf("🔁 Market reseeded — %s regime, %s metric", regime, metric))
 	pending := ex.DrainPending()
 	s.ex.unlock()
 
@@ -530,6 +554,7 @@ func (s *server) handleReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "reset complete",
 		"metric": metric,
+		"regime": regime,
 	})
 }
 

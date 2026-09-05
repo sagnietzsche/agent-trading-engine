@@ -70,7 +70,7 @@ func seedFresh(ctx context.Context, pool *pgxpool.Pool) error {
 		inv  int
 	}{
 		{MarketMakerID, "market_maker", 10_000_000.0, 0},
-		{SolidarityID, "solidarity_bot", 6_000_000.0, 40_000},
+		{SolidarityID, liquidityBotName(marketRegimeFromEnv()), 6_000_000.0, 40_000},
 	}
 	for _, b := range bots {
 		_, err := pool.Exec(ctx, `
@@ -330,8 +330,8 @@ func agentValues(m map[uuid.UUID]AgentCache) []AgentCache {
 }
 
 // bootExchange builds the in-memory exchange from whatever is in Postgres,
-// using the process's WELFARE_METRIC env var (the metric is instance config,
-// not persisted state).
+// using the process's WELFARE_METRIC and MARKET_REGIME env vars (both are
+// instance config, not persisted state).
 func bootExchange(ctx context.Context, pool *pgxpool.Pool) (*Exchange, error) {
 	rows, err := loadRows(ctx, pool)
 	if err != nil {
@@ -343,6 +343,7 @@ func bootExchange(ctx context.Context, pool *pgxpool.Pool) (*Exchange, error) {
 		return nil, err
 	}
 	state.Metric = welfareMetricFromEnv()
+	state.Regime = marketRegimeFromEnv()
 	return Restore(state), nil
 }
 

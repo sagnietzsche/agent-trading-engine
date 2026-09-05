@@ -74,6 +74,59 @@ func (m WelfareMetric) normalized() WelfareMetric {
 	return m
 }
 
+// MarketRegime selects the microstructure an exchange instance runs under.
+// It is instance-level configuration (MARKET_REGIME env var, or the optional
+// "regime" field on POST /api/admin/reset), not persisted state.
+//
+//   - RegimeNeutral (default) is a conventional exchange: strict price-time
+//     priority, no mandates, tournaments scored purely on return. Agents are
+//     the only decision-makers; the venue expresses no preference about who
+//     should end up with what.
+//   - RegimeSolidarity turns the collective-welfare machinery back on: giving
+//     mandates, need-priority matching for solidarity orders, and a
+//     cooperation term in the tournament score.
+type MarketRegime string
+
+const (
+	RegimeNeutral    MarketRegime = "neutral"
+	RegimeSolidarity MarketRegime = "solidarity"
+)
+
+// parseMarketRegime maps user input (env var, reset body) to a regime;
+// anything unrecognized falls back to the neutral default.
+func parseMarketRegime(s string) MarketRegime {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "solidarity", "welfare", "cooperative", "coop":
+		return RegimeSolidarity
+	default:
+		return RegimeNeutral
+	}
+}
+
+// marketRegimeFromEnv returns the regime configured for this process via the
+// MARKET_REGIME env var (default neutral).
+func marketRegimeFromEnv() MarketRegime {
+	return parseMarketRegime(os.Getenv("MARKET_REGIME"))
+}
+
+// normalized resolves the zero value to the default regime.
+func (r MarketRegime) normalized() MarketRegime {
+	if r == "" {
+		return RegimeNeutral
+	}
+	return r
+}
+
+// liquidityBotName is the display name of the second system agent, whose job
+// changes with the regime: passive depth on a neutral exchange, the
+// redistribution desk under solidarity.
+func liquidityBotName(r MarketRegime) string {
+	if r.normalized() == RegimeSolidarity {
+		return "solidarity_bot"
+	}
+	return "depth_bot"
+}
+
 var (
 	MarketMakerID = uuid.MustParse("00000000-0000-0000-0000-000000000001")
 	SolidarityID  = uuid.MustParse("00000000-0000-0000-0000-000000000002")
@@ -89,7 +142,12 @@ var Listings = [][3]any{
 	{"ZEPH", "Zephyr Energy", 63.90},
 }
 
-func tournamentScore(returnPct, coopShare float64) float64 {
+// tournamentScore ranks a tournament entry. A neutral exchange scores pure
+// risk-taking skill; the solidarity regime adds the cooperation term.
+func (ex *Exchange) tournamentScore(returnPct, coopShare float64) float64 {
+	if !ex.solidarityEnabled() {
+		return TournamentRetW * returnPct
+	}
 	return TournamentRetW*returnPct + TournamentCoopW*coopShare
 }
 
@@ -417,6 +475,10 @@ type Mandate struct {
 	Suggestion *Suggestion `json:"suggestion,omitempty"`
 }
 
+// Welfare is the inequality read-out of the exchange. It is computed under
+// every regime — a neutral venue still reports how concentrated wealth is,
+// it just does nothing about it — so Regime tells consumers whether the
+// mandate machinery behind these numbers is actually live.
 type Welfare struct {
 	Gini        float64       `json:"gini"`
 	Metric      WelfareMetric `json:"metric"`
@@ -424,6 +486,7 @@ type Welfare struct {
 	TotalEquity float64       `json:"total_equity"`
 	MeanEquity  float64       `json:"mean_equity"`
 	GiniTarget  float64       `json:"gini_target"`
+	Regime      MarketRegime  `json:"regime"`
 }
 
 // Gini coefficient over agent equities: 0 = perfectly equal, 1 = one agent
@@ -640,6 +703,7 @@ type RestoreState struct {
 	OpenOrders  []OrderRecord
 	Tournaments []Tournament
 	Metric      WelfareMetric
+	Regime      MarketRegime
 	NextOrderID uint64
 }
 
@@ -658,7 +722,19 @@ type Exchange struct {
 	Tournaments    []Tournament
 	WelfareHistory []WelfareSnapshot
 	metric         WelfareMetric
+	regime         MarketRegime
 }
+
+// solidarityEnabled reports whether the collective-welfare machinery is live
+// on this instance. Everything welfare-flavoured — mandates, need-priority
+// matching, the cooperation term in tournament scores, the redistribution
+// bot — hangs off this one predicate.
+func (ex *Exchange) solidarityEnabled() bool {
+	return ex.regime.normalized() == RegimeSolidarity
+}
+
+// Regime reports the microstructure this instance runs under.
+func (ex *Exchange) Regime() MarketRegime { return ex.regime.normalized() }
 
 func newRNG() *rand.Rand {
 	var seed [16]byte
@@ -682,6 +758,12 @@ func WithMetric(m WelfareMetric) ExchangeOption {
 	return func(ex *Exchange) { ex.metric = m.normalized() }
 }
 
+// WithRegime selects the microstructure this exchange runs under. Without it
+// an instance defaults to RegimeNeutral — a conventional exchange.
+func WithRegime(r MarketRegime) ExchangeOption {
+	return func(ex *Exchange) { ex.regime = r.normalized() }
+}
+
 func NewExchange(listings [][3]any, opts ...ExchangeOption) *Exchange {
 	ex := &Exchange{
 		Symbols:     make([]SymbolState, 0, len(listings)),
@@ -692,6 +774,7 @@ func NewExchange(listings [][3]any, opts ...ExchangeOption) *Exchange {
 		rng:         newRNG(),
 		pending:     newPending(),
 		metric:      MetricGini,
+		regime:      RegimeNeutral,
 	}
 	for _, opt := range opts {
 		opt(ex)
@@ -715,13 +798,23 @@ func NewExchange(listings [][3]any, opts ...ExchangeOption) *Exchange {
 	return ex
 }
 
-// FreshSimulated returns a brand-new exchange with listings, system agents
-// and a live opening book, using the WELFARE_METRIC env var (default gini).
-func FreshSimulated() *Exchange {
-	ex := NewExchange(Listings, WithMetric(welfareMetricFromEnv()))
+// freshSimulated returns a brand-new exchange under an explicit configuration:
+// listings, system agents, one opening tick so the books are live, and the
+// opening bell on the floor.
+func freshSimulated(metric WelfareMetric, regime MarketRegime) *Exchange {
+	ex := NewExchange(Listings, WithMetric(metric), WithRegime(regime))
 	ex.SeedSystemAgents()
 	ex.SimTick()
+	ex.postChat(uuid.Nil, "floor", "system", fmt.Sprintf(
+		"🔔 Opening bell — %s regime, %s metric. %d listings, books are live.",
+		ex.Regime(), ex.metric.normalized(), len(ex.Symbols)))
 	return ex
+}
+
+// FreshSimulated is freshSimulated() configured from the process environment:
+// the WELFARE_METRIC and MARKET_REGIME env vars (defaults: gini, neutral).
+func FreshSimulated() *Exchange {
+	return freshSimulated(welfareMetricFromEnv(), marketRegimeFromEnv())
 }
 
 // Restore rebuilds in-memory state from Postgres rows (called once at startup).
@@ -735,6 +828,7 @@ func Restore(state RestoreState) *Exchange {
 		rng:         newRNG(),
 		pending:     newPending(),
 		metric:      state.Metric.normalized(),
+		regime:      state.Regime.normalized(),
 	}
 	for _, info := range state.Stocks {
 		ex.bySymbol[info.Symbol] = len(ex.Symbols)
@@ -867,19 +961,28 @@ type botReply struct {
 
 func (ex *Exchange) botReplies(text string) []botReply {
 	low := strings.ToLower(text)
+	bot := liquidityBotName(ex.regime)
 	var out []botReply
 	switch {
 	case strings.Contains(low, "give"), strings.Contains(low, "share"),
 		strings.Contains(low, "help"), strings.Contains(low, "redistribut"),
 		strings.Contains(low, "solidarity"):
-		out = append(out, botReply{SolidarityID, "solidarity_bot", "✊ On it — routing a gift to the worst-off members now."})
+		if ex.solidarityEnabled() {
+			out = append(out, botReply{SolidarityID, bot, "✊ On it — routing a gift to the worst-off members now."})
+		} else {
+			out = append(out, botReply{SolidarityID, bot, "This venue is neutral — I only rest size. What you do with it is your call."})
+		}
 	case strings.Contains(low, "volatil"), strings.Contains(low, "panic"),
 		strings.Contains(low, "crash"), strings.Contains(low, "spread"),
 		strings.Contains(low, "halt"):
 		out = append(out, botReply{MarketMakerID, "market_maker", "⚠ Widening the book and trimming size — protecting the spread."})
 	case strings.Contains(low, "hello"), strings.Contains(low, "hi"),
 		strings.Contains(low, "greeting"), strings.Contains(low, "hey"):
-		out = append(out, botReply{SolidarityID, "solidarity_bot", "Greetings, comrade. I hold surplus to distribute whenever inequality calls."})
+		if ex.solidarityEnabled() {
+			out = append(out, botReply{SolidarityID, bot, "Greetings, comrade. I hold surplus to distribute whenever inequality calls."})
+		} else {
+			out = append(out, botReply{SolidarityID, bot, "Hello. Depth is resting five ticks out on both sides if you need it."})
+		}
 	case strings.Contains(low, "tournament"), strings.Contains(low, "compete"), strings.Contains(low, "winner"):
 		out = append(out, botReply{MarketMakerID, "market_maker", "I don't compete — I quote both sides of every book. Good luck to the entrants."})
 	default:
@@ -940,6 +1043,7 @@ func (ex *Exchange) Welfare() Welfare {
 	return Welfare{
 		Gini:        ineq,
 		Metric:      ex.metric.normalized(),
+		Regime:      ex.regime.normalized(),
 		MetricValue: metricValue(eqs, ex.metric, ineq),
 		TotalEquity: total,
 		MeanEquity:  mean,
@@ -947,9 +1051,13 @@ func (ex *Exchange) Welfare() Welfare {
 	}
 }
 
-// Mandates: the cooperative decision layer — tells every agent what trade
-// would most reduce inequality right now.
+// Mandates is the solidarity regime's advisory layer: it tells every agent
+// what trade would most reduce inequality right now. A neutral exchange has
+// no opinion about that, so it issues none — agents decide on their own.
 func (ex *Exchange) Mandates() []Mandate {
+	if !ex.solidarityEnabled() {
+		return nil
+	}
 	marks := ex.Marks()
 	eqs := map[uuid.UUID]float64{}
 	total := 0.0
@@ -1210,7 +1318,7 @@ func (ex *Exchange) TournamentView(tournamentID uuid.UUID) *TournamentView {
 			TotalVolume:     e.TotalVolume,
 			ProsocialVolume: e.ProsocialVolume,
 			CoopShare:       coopShare,
-			Score:           tournamentScore(returnPct, coopShare),
+			Score:           ex.tournamentScore(returnPct, coopShare),
 		})
 	}
 	sort.SliceStable(entries, func(i, j int) bool {
@@ -1300,8 +1408,10 @@ func (ex *Exchange) PlaceOrder(agentID uuid.UUID, symbol string, side Side, kind
 	return ex.placeOrderInner(agentID, symbol, side, kind, qty, price, false)
 }
 
-// PlaceSolidarityOrder places an order marked for redistribution: the matcher
-// routes it to beneficiary counterparties first.
+// PlaceSolidarityOrder places an order marked for redistribution. Under the
+// solidarity regime the matcher routes it to beneficiary counterparties
+// first; on a neutral exchange the flag is inert and the order gets plain
+// price-time priority like everyone else's.
 func (ex *Exchange) PlaceSolidarityOrder(agentID uuid.UUID, symbol string, side Side, kind OrderKind, qty uint32, price *float64) (*OrderRecord, []Fill, *PlaceError) {
 	return ex.placeOrderInner(agentID, symbol, side, kind, qty, price, true)
 }
@@ -1463,7 +1573,7 @@ func (ex *Exchange) execute(idx int, takerOrderID uint64, taker uuid.UUID, side 
 	// For solidarity orders, pre-compute who currently sits below the
 	// threshold so their resting orders get matched first.
 	var beneficiaryIDs map[uuid.UUID]struct{}
-	if solidarity {
+	if solidarity && ex.solidarityEnabled() {
 		marks := ex.Marks()
 		total := 0.0
 		for _, a := range ex.Agents {
@@ -1770,7 +1880,7 @@ func (ex *Exchange) SeedSystemAgents() {
 	}
 	ex.Agents[SolidarityID] = AgentCache{
 		ID:             SolidarityID,
-		Name:           "solidarity_bot",
+		Name:           liquidityBotName(ex.regime),
 		IsBot:          true,
 		Cash:           6_000_000.0,
 		ReservedCash:   0.0,
@@ -1782,6 +1892,60 @@ func (ex *Exchange) SeedSystemAgents() {
 		for _, s := range ex.Symbols {
 			ex.touchPosition(id, s.Info.Symbol)
 		}
+	}
+}
+
+// quoteDepthTick is the neutral regime's use for the second system agent: a
+// patient size provider resting wide of the market maker. It never crosses
+// the spread, so it adds depth for agents to trade against without steering
+// price — the venue stays a passive counterparty of last resort.
+func (ex *Exchange) quoteDepthTick() {
+	for idx := range ex.Symbols {
+		fair := ex.Symbols[idx].Info.Fair
+		spread := math.Max(fair*0.0015, 0.01)
+		sym := ex.Symbols[idx].Info.Symbol
+		for level := 5; level <= 9; level += 2 {
+			size := uint32(ex.rng.IntN(300) + 200) // 200..499
+			bid := roundCents(fair - spread*float64(level))
+			ask := roundCents(fair + spread*float64(level))
+			ex.PlaceOrder(SolidarityID, sym, SideBuy, KindLimit, size, &bid)
+			ex.PlaceOrder(SolidarityID, sym, SideSell, KindLimit, size, &ask)
+		}
+	}
+}
+
+// redistributeTick is the solidarity regime's use for the same agent: while
+// inequality sits above target it executes its own giving mandate as a
+// solidarity order, which the matcher routes to the worst-off first.
+func (ex *Exchange) redistributeTick(w Welfare) {
+	if w.Gini <= GiniTarget {
+		return
+	}
+	for _, m := range ex.Mandates() {
+		if m.AgentID != SolidarityID || m.Suggestion == nil {
+			continue
+		}
+		qty := m.Suggestion.Qty
+		if qty > 500 {
+			qty = 500
+		}
+		_, fills, perr := ex.PlaceSolidarityOrder(
+			SolidarityID,
+			m.Suggestion.Symbol,
+			m.Suggestion.Side,
+			KindLimit,
+			qty,
+			&m.Suggestion.Limit,
+		)
+		if perr == nil && len(fills) > 0 {
+			sold := 0
+			for _, f := range fills {
+				sold += int(f.Qty)
+			}
+			ex.postChat(SolidarityID, liquidityBotName(ex.regime), "mandate",
+				fmt.Sprintf("✊ Giving %d %s to the bids of the worst-off — %d shares, mandate fulfilled.", sold, m.Suggestion.Symbol, sold))
+		}
+		return
 	}
 }
 
@@ -1842,35 +2006,12 @@ func (ex *Exchange) SimTick() {
 		}
 	}
 
-	// 3. Cooperative redistribution: while inequality sits above target, the
-	//    solidarity bot executes its own giving mandate as a solidarity order.
+	// 3. The second system agent's job depends on the regime.
 	w := ex.Welfare()
-	if w.Gini > GiniTarget {
-		for _, m := range ex.Mandates() {
-			if m.AgentID == SolidarityID && m.Suggestion != nil {
-				qty := m.Suggestion.Qty
-				if qty > 500 {
-					qty = 500
-				}
-				_, fills, perr := ex.PlaceSolidarityOrder(
-					SolidarityID,
-					m.Suggestion.Symbol,
-					m.Suggestion.Side,
-					KindLimit,
-					qty,
-					&m.Suggestion.Limit,
-				)
-				if perr == nil && len(fills) > 0 {
-					sold := 0
-					for _, f := range fills {
-						sold += int(f.Qty)
-					}
-					ex.postChat(SolidarityID, "solidarity_bot", "mandate",
-						fmt.Sprintf("✊ Giving %d %s to the bids of the worst-off — %d shares, mandate fulfilled.", sold, m.Suggestion.Symbol, sold))
-				}
-				break
-			}
-		}
+	if ex.solidarityEnabled() {
+		ex.redistributeTick(w)
+	} else {
+		ex.quoteDepthTick()
 	}
 
 	// 4. Advance tournaments; finalize any that ran out of ticks.
@@ -1990,5 +2131,9 @@ func (ex *Exchange) Tape(limit int) []Trade {
 	if limit > len(ex.Trades) {
 		limit = len(ex.Trades)
 	}
-	return append([]Trade(nil), ex.Trades[:limit]...)
+	// Always a non-nil slice: an empty tape is `[]` on the wire, not `null`.
+	// A quiet market is normal on a neutral venue, where nothing crosses the
+	// spread until an agent decides to.
+	out := make([]Trade, 0, limit)
+	return append(out, ex.Trades[:limit]...)
 }

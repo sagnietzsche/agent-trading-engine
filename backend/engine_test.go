@@ -7,13 +7,22 @@ import (
 	"github.com/google/uuid"
 )
 
-func testExchange() *Exchange {
-	// Fresh exchange whose opening simulation has been flushed, so tests
-	// start with clean pending buffers.
-	ex := FreshSimulated()
+// exchangeFor builds a fresh exchange under an explicit regime, opening
+// simulation flushed so tests start with clean pending buffers. The regime is
+// named rather than inherited from MARKET_REGIME: a developer running the
+// suite with that env var set must not see different results.
+func exchangeFor(regime MarketRegime) *Exchange {
+	ex := freshSimulated(MetricGini, regime)
 	ex.DrainPending()
 	return ex
 }
+
+// testExchange is the default: a conventional, neutral venue.
+func testExchange() *Exchange { return exchangeFor(RegimeNeutral) }
+
+// solidarityExchange opts into the welfare microstructure — mandates,
+// need-priority matching, cooperation scoring.
+func solidarityExchange() *Exchange { return exchangeFor(RegimeSolidarity) }
 
 func clearBots(ex *Exchange) {
 	ex.CancelAllForAgent(MarketMakerID)
@@ -398,7 +407,7 @@ func TestCancelReleasesReservations(t *testing.T) {
 }
 
 func TestMandatesPointContributorsToSellAndBeneficiariesToBuy(t *testing.T) {
-	ex := testExchange()
+	ex := solidarityExchange()
 	whale := ex.RegisterAgent("whale", 60_000_000.0)
 	wc := ex.Agents[whale]
 	wc.Positions["NOVA"] = 10_000
@@ -452,7 +461,7 @@ func TestMandatesPointContributorsToSellAndBeneficiariesToBuy(t *testing.T) {
 }
 
 func TestSolidarityOrdersRouteToBeneficiariesFirst(t *testing.T) {
-	ex := testExchange()
+	ex := solidarityExchange()
 	clearBots(ex)
 	rich := ex.RegisterAgent("rich", 60_000_000.0)
 	rc := ex.Agents[rich]
@@ -489,7 +498,7 @@ func TestSolidarityOrdersRouteToBeneficiariesFirst(t *testing.T) {
 }
 
 func TestSustainedGiftingReachesThoseWhoAsk(t *testing.T) {
-	ex := NewExchange(Listings)
+	ex := NewExchange(Listings, WithRegime(RegimeSolidarity))
 	ex.SeedSystemAgents()
 	clearBots(ex)
 
@@ -548,8 +557,10 @@ func TestMMRequoteDoesNotGrowBooksForever(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		ex.SimTick()
 	}
+	// Both system agents requote every tick: 3 levels x 2 sides for the
+	// market maker, 3 x 2 for the neutral depth provider.
 	for i := range ex.Symbols {
-		if len(ex.Symbols[i].Book.orders) > 6 {
+		if len(ex.Symbols[i].Book.orders) > 12 {
 			t.Fatalf("%s book has %d resting orders", ex.Symbols[i].Info.Symbol, len(ex.Symbols[i].Book.orders))
 		}
 		if b, a := ex.Symbols[i].Book.BestBid(), ex.Symbols[i].Book.BestAsk(); b != nil && a != nil && *b >= *a {
@@ -666,20 +677,108 @@ func TestRestoreRebuildsBooksAndReservations(t *testing.T) {
 }
 
 func TestTournamentScoringFormula(t *testing.T) {
-	if math.Abs(tournamentScore(0.10, 0.0)-0.10) > 1e-9 {
+	coop := solidarityExchange()
+	if math.Abs(coop.tournamentScore(0.10, 0.0)-0.10) > 1e-9 {
 		t.Fatal("score mismatch")
 	}
-	if math.Abs(tournamentScore(-0.05, 1.0)-0.95) > 1e-9 {
+	if math.Abs(coop.tournamentScore(-0.05, 1.0)-0.95) > 1e-9 {
 		t.Fatal("score mismatch")
 	}
-	// Cooperation can fully offset a small loss: pure P&L is not the goal.
-	if tournamentScore(-0.20, 1.0) <= tournamentScore(0.15, 0.0) {
+	// Under solidarity, cooperation can fully offset a small loss.
+	if coop.tournamentScore(-0.20, 1.0) <= coop.tournamentScore(0.15, 0.0) {
 		t.Fatal("cooperation should beat modest profit")
+	}
+
+	// A neutral venue scores return and nothing else.
+	neutral := testExchange()
+	if math.Abs(neutral.tournamentScore(0.10, 1.0)-0.10) > 1e-9 {
+		t.Fatal("neutral regime must ignore the cooperation term")
+	}
+	if neutral.tournamentScore(-0.20, 1.0) >= neutral.tournamentScore(0.15, 0.0) {
+		t.Fatal("neutral regime must rank pure P&L")
+	}
+}
+
+// The default exchange is a conventional venue: it issues no instructions and
+// gives redistribution no matching privilege.
+func TestRegimeParsingAndEnvSelection(t *testing.T) {
+	for input, want := range map[string]MarketRegime{
+		"solidarity": RegimeSolidarity,
+		"SOLIDARITY": RegimeSolidarity,
+		"  coop  ":   RegimeSolidarity,
+		"welfare":    RegimeSolidarity,
+		"neutral":    RegimeNeutral,
+		"":           RegimeNeutral,
+		"nonsense":   RegimeNeutral,
+	} {
+		if got := parseMarketRegime(input); got != want {
+			t.Fatalf("parseMarketRegime(%q) = %s, want %s", input, got, want)
+		}
+	}
+	if MarketRegime("").normalized() != RegimeNeutral {
+		t.Fatal("zero value should normalize to neutral")
+	}
+
+	t.Setenv("MARKET_REGIME", "solidarity")
+	if marketRegimeFromEnv() != RegimeSolidarity {
+		t.Fatal("MARKET_REGIME=solidarity not picked up")
+	}
+	// FreshSimulated reads the env var, which is how a deployment selects a
+	// regime without recompiling.
+	if ex := FreshSimulated(); ex.Regime() != RegimeSolidarity {
+		t.Fatalf("FreshSimulated regime = %s, want solidarity", ex.Regime())
+	}
+	if liquidityBotName(RegimeSolidarity) != "solidarity_bot" ||
+		liquidityBotName(RegimeNeutral) != "depth_bot" {
+		t.Fatal("system agent name should follow the regime")
+	}
+
+	t.Setenv("MARKET_REGIME", "")
+	if ex := FreshSimulated(); ex.Regime() != RegimeNeutral {
+		t.Fatalf("unset MARKET_REGIME regime = %s, want neutral", ex.Regime())
+	}
+}
+
+func TestNeutralRegimeIssuesNoMandatesAndNoNeedPriority(t *testing.T) {
+	ex := testExchange()
+	if ex.Regime() != RegimeNeutral {
+		t.Fatalf("default regime = %s, want neutral", ex.Regime())
+	}
+	clearBots(ex)
+	rich := ex.RegisterAgent("rich", 60_000_000.0)
+	rc := ex.Agents[rich]
+	rc.Positions["NOVA"] = 5_000
+	ex.Agents[rich] = rc
+	comfortable := ex.RegisterAgent("comfortable", 30_000_000.0)
+	poor := ex.RegisterAgent("poor", 2_000.0)
+
+	if m := ex.Mandates(); len(m) != 0 {
+		t.Fatalf("neutral exchange issued %d mandates, want 0", len(m))
+	}
+	if w := ex.Welfare(); w.Regime != RegimeNeutral {
+		t.Fatalf("welfare regime = %s, want neutral", w.Regime)
+	}
+
+	// Same book as the solidarity test: the better-priced bid belongs to the
+	// comfortable member, the worse-priced one to the member in need.
+	mustPlace(t, ex, comfortable, "NOVA", SideBuy, KindLimit, 5, fptr(185.0))
+	mustPlace(t, ex, poor, "NOVA", SideBuy, KindLimit, 5, fptr(180.0))
+
+	// Even flagged as solidarity, price-time priority decides here.
+	_, fills, perr := ex.PlaceSolidarityOrder(rich, "NOVA", SideSell, KindLimit, 5, fptr(179.0))
+	if perr != nil {
+		t.Fatalf("order rejected: %+v", perr)
+	}
+	if len(fills) != 1 {
+		t.Fatalf("fills = %d, want 1", len(fills))
+	}
+	if ex.Trades[0].Buyer != comfortable {
+		t.Fatal("neutral matching must take the best price, not the neediest counterparty")
 	}
 }
 
 func TestTournamentLifecycleAndAttribution(t *testing.T) {
-	ex := testExchange()
+	ex := solidarityExchange()
 	clearBots(ex)
 	rich := ex.RegisterAgent("rich", 60_000_000.0)
 	rc := ex.Agents[rich]
